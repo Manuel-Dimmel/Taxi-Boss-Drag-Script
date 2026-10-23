@@ -29,6 +29,7 @@ Hotkeys:
 - [p] Skript sauber beenden
 """
 
+
 from __future__ import annotations
 
 import os
