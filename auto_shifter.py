@@ -21,27 +21,24 @@ Gefundene graue Kreise im Tacho (horizontal exakt mittig bei X = 50.00 %):
    - Physische Koordinate: (1710, 1886) [Retina Pixel im Screenshot]
    - Ruhefarbe (Hellgrau): RGB(200, 200, 200) / #C8C8C8
 
-Hinweis zu macOS Retina & mss:
-------------------------------
-Screenshots unter macOS werden in physischen Retina-Pixeln (Faktor 2x: 3420x2214)
-gespeichert, während `pynput` Maus-Koordinaten in logischen Quartz-Punkten
-(1710x1107) liefert. Dieses Skript ermittelt sowohl den Retina-Backing-Scale-Faktor
-als auch einen etwaigen Koordinaten-Skalierungsfaktor zwischen `pynput` und `mss`
-automatisch, sodass der abgefragte 3x3-Bereich exakt mit der Mausposition
-übereinstimmt.
-
 Hotkeys:
 --------
 - [i] Aktuelle Mausposition als Schalt-Punkt speichern + RGB-Wert im Terminal ausgeben
+      (WICHTIG: Der Kreis darf dabei noch GRAU sein! Es wird nur die Position gespeichert.)
 - [o] Auto-Shifter starten / pausieren
 - [p] Skript sauber beenden
 """
 
 from __future__ import annotations
 
+import os
+import select
+import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 from typing import Any, Tuple
 
 import mss
@@ -56,6 +53,11 @@ try:
     import Quartz
 except ImportError:
     Quartz = None  # type: ignore[assignment]
+
+try:
+    import ApplicationServices
+except ImportError:
+    ApplicationServices = None  # type: ignore[assignment]
 
 
 # ============================================================================
@@ -78,6 +80,13 @@ KEY_HOLD_DURATION: float = 0.035  # Kurze Haltedauer (35 ms), damit Roblox die E
 SHIFT_COOLDOWN: float = 0.25      # 0.25 s Entprellung nach jedem Schaltvorgang
 SCAN_INTERVAL: float = 0.004      # ~250 Hz Scan-Schleife für minimale Latenz
 
+# macOS Virtual KeyCodes für i, o, p (falls key.char in Roblox/Vollbild leer ist)
+MACOS_VK_MAP: dict[int, str] = {
+    34: "i",  # Taste 'i'
+    31: "o",  # Taste 'o'
+    35: "p",  # Taste 'p'
+}
+
 
 def create_mss_instance() -> Any:
     """Erstellt eine MSS-Instanz kompatibel mit mss 9.x und mss 10.x+ (ohne DeprecationWarning)."""
@@ -97,6 +106,48 @@ def detect_retina_scale() -> float:
     return 2.0
 
 
+def check_and_request_macos_permissions() -> Tuple[bool, bool, bool]:
+    """
+    Prüft die macOS-Berechtigungen für:
+      1. Bildschirmaufnahme (Screen Recording) -> für mss
+      2. Eingabeüberwachung (Input Monitoring) -> für globale Hotkeys (i, o, p)
+      3. Bedienungshilfen (Accessibility)      -> für automatisches Drücken von 'e'
+    Falls Berechtigungen fehlen, wird der macOS-Systemdialog angefordert.
+    """
+    screen_ok = True
+    listen_ok = True
+    post_ok = True
+
+    if Quartz is not None:
+        if hasattr(Quartz, "CGPreflightScreenCaptureAccess"):
+            screen_ok = bool(Quartz.CGPreflightScreenCaptureAccess())
+            if not screen_ok and hasattr(Quartz, "CGRequestScreenCaptureAccess"):
+                Quartz.CGRequestScreenCaptureAccess()
+
+        if hasattr(Quartz, "CGPreflightListenEventAccess"):
+            listen_ok = bool(Quartz.CGPreflightListenEventAccess())
+            if not listen_ok and hasattr(Quartz, "CGRequestListenEventAccess"):
+                Quartz.CGRequestListenEventAccess()
+
+        if hasattr(Quartz, "CGPreflightPostEventAccess"):
+            post_ok = bool(Quartz.CGPreflightPostEventAccess())
+            if not post_ok and hasattr(Quartz, "CGRequestPostEventAccess"):
+                Quartz.CGRequestPostEventAccess()
+
+    if ApplicationServices is not None and hasattr(ApplicationServices, "AXIsProcessTrusted"):
+        ax_ok = bool(ApplicationServices.AXIsProcessTrusted())
+        if not ax_ok and hasattr(ApplicationServices, "AXIsProcessTrustedWithOptions"):
+            try:
+                ApplicationServices.AXIsProcessTrustedWithOptions(
+                    {ApplicationServices.kAXTrustedCheckOptionPrompt: True}
+                )
+            except Exception:
+                pass
+        post_ok = post_ok and ax_ok
+
+    return screen_ok, listen_ok, post_ok
+
+
 class AutoShifter:
     """Performanter macOS Auto-Shifter für Taxi Boss (Roblox)."""
 
@@ -108,6 +159,7 @@ class AutoShifter:
         self.active: bool = False
         self.running: bool = True
         self.shift_count: int = 0
+        self._last_cmd_time: dict[str, float] = {"i": 0.0, "o": 0.0, "p": 0.0}
 
         self.retina_scale: float = detect_retina_scale()
 
@@ -129,7 +181,6 @@ class AutoShifter:
             self.logical_height = self.mss_height
 
         # Faktor zwischen logischen pynput-Punkten und mss-Koordinaten
-        # (1.0 wenn mss logische Quartz-Koordinaten nutzt, 2.0 falls mss physische Pixel erwartet)
         self.mss_coord_scale_x: float = (
             self.mss_width / self.logical_width if self.logical_width else 1.0
         )
@@ -236,7 +287,11 @@ class AutoShifter:
         phys_y = int(round(logical_y * self.retina_scale))
         r, g, b = rgb
         hex_color = f"#{r:02X}{g:02X}{b:02X}"
-        green_status = "GRÜN ERKANNT (Schaltpunkt!)" if detected_green else "Nicht grün (Ruhezustand)"
+        green_status = (
+            "GRÜN ERKANNT (Schaltpunkt!)"
+            if detected_green
+            else "Grau / Nicht grün (Position gespeichert – bereit für Grün!)"
+        )
 
         print(
             f"\n[KALIBRIERUNG - i] Aktuelle Mausposition als Schalt-Punkt gespeichert:\n"
@@ -274,6 +329,27 @@ class AutoShifter:
             self.active = False
         print("\n[BEENDEN - p] Auto-Shifter wird sauber beendet ...", flush=True)
 
+    def handle_command(self, cmd: str) -> bool:
+        """
+        Verarbeitet einen Hotkey-Befehl ('i', 'o', 'p') mit kurzer Entprellung (150 ms),
+        damit globaler Listener und Terminal-Listener nicht doppelt auslösen.
+        Gibt True zurück, wenn das Skript beendet werden soll.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_cmd_time.get(cmd, 0.0) < 0.15:
+                return not self.running
+            self._last_cmd_time[cmd] = now
+
+        if cmd == "i":
+            self.calibrate_at_mouse()
+        elif cmd == "o":
+            self.toggle_active()
+        elif cmd == "p":
+            self.stop()
+            return True
+        return False
+
     def monitor_loop(self) -> None:
         """
         Hauptschleife für die Echtzeit-Farberkennung.
@@ -306,8 +382,58 @@ class AutoShifter:
                 else:
                     time.sleep(SCAN_INTERVAL)
 
-    def print_banner(self) -> None:
-        """Gibt beim Start alle System-, Analyse- und Hotkey-Informationen im Terminal aus."""
+    def stdin_fallback_loop(self) -> None:
+        """
+        Fallback-Tastatur-Listener direkt im Terminal / in der PyCharm-Konsole:
+        Funktioniert auch dann sofort, wenn macOS die globalen Eingabeüberwachungs-Rechte
+        für PyCharm/Terminal noch nicht freigegeben hat.
+        """
+        if not sys.stdin or sys.stdin.closed:
+            return
+
+        fd = None
+        old_settings = None
+        is_tty = False
+        try:
+            fd = sys.stdin.fileno()
+            is_tty = os.isatty(fd)
+            if is_tty:
+                old_settings = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+        except Exception:
+            is_tty = False
+
+        try:
+            while self.running:
+                if is_tty and fd is not None:
+                    rlist, _, _ = select.select([fd], [], [], 0.1)
+                    if rlist:
+                        ch = os.read(fd, 1).decode("utf-8", errors="ignore").lower()
+                        if ch in ("i", "o", "p"):
+                            if self.handle_command(ch):
+                                break
+                else:
+                    # PyCharm Run-Konsole (Zeilenpufferung: Buchstabe + Enter)
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+                    if rlist:
+                        line = sys.stdin.readline()
+                        if not line:
+                            break
+                        cmd = line.strip().lower()
+                        if cmd in ("i", "o", "p"):
+                            if self.handle_command(cmd):
+                                break
+        except Exception:
+            pass
+        finally:
+            if is_tty and fd is not None and old_settings is not None:
+                try:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                except Exception:
+                    pass
+
+    def print_banner(self, screen_ok: bool, listen_ok: bool, post_ok: bool) -> None:
+        """Gibt beim Start alle System-, Berechtigungs- und Hotkey-Informationen im Terminal aus."""
         phys_w = int(round(self.logical_width * self.retina_scale))
         phys_h = int(round(self.logical_height * self.retina_scale))
         phys_tx = int(round(self.target_logical_x * self.retina_scale))
@@ -316,9 +442,9 @@ class AutoShifter:
         with create_mss_instance() as sct:
             init_rgb, _ = self.sample_region(sct, self.target_logical_x, self.target_logical_y)
 
-        print("=" * 74)
+        print("=" * 76)
         print("  TAXI BOSS (ROBLOX) – AUTO-SHIFTER FÜR macOS")
-        print("=" * 74)
+        print("=" * 76)
         print(f"  Bildschirm (Logisch):  {self.logical_width} x {self.logical_height} Punkte (pynput)")
         print(f"  Bildschirm (Retina):   {phys_w} x {phys_h} Pixel (Skalierung {self.retina_scale:.1f}x)")
         print(
@@ -331,33 +457,70 @@ class AutoShifter:
             f"G > R * {GREEN_DOMINANCE_RATIO}, G > B * {GREEN_DOMINANCE_RATIO}"
         )
         print(f"  Schalt-Cooldown:       {SHIFT_COOLDOWN:.2f} Sekunden")
-        print("-" * 74)
+        print("-" * 76)
+        print("  macOS-Berechtigungsstatus (für PyCharm / Terminal):")
+        print(f"    1. Bildschirmaufnahme (mss):           {'OK' if screen_ok else 'FEHLT!'}")
+        print(f"    2. Eingabeüberwachung (Hotkeys i/o/p): {'OK' if listen_ok else 'FEHLT! (siehe Hinweis unten)'}")
+        print(f"    3. Bedienungshilfen (Taste e drücken): {'OK' if post_ok else 'FEHLT! (siehe Hinweis unten)'}")
+
+        if not (listen_ok and post_ok):
+            print("-" * 76)
+            print("  WICHTIG – WARUM [i] NOCH NICHT GLOBAL REAGIERT HAT:")
+            print("  macOS blockiert globale Tastendrücke, solange PyCharm (bzw. Terminal) nicht")
+            print("  in den Systemeinstellungen freigegeben ist:")
+            print("    -> Systemeinstellungen -> Datenschutz & Sicherheit -> Bedienungshilfen")
+            print("    -> Systemeinstellungen -> Datenschutz & Sicherheit -> Eingabeüberwachung")
+            print("  Schalte dort den Schalter für PyCharm / Terminal ein und starte das Skript neu.")
+            print("  (Tipp: Direkt hier in der Konsole kannst du 'i', 'o', 'p' [+ Enter in PyCharm]")
+            print("   auch jetzt schon zum Testen eingeben!)")
+
+        print("-" * 76)
         print("  Steuerung per Hotkeys:")
-        print("    [i]   Aktuelle Mausposition als Schalt-Punkt speichern + RGB anzeigen")
+        print("    [i]   Mausposition als Schalt-Punkt speichern + RGB anzeigen")
+        print("          (Der Kreis darf beim Drücken von [i] GRAU sein – es wird nur der Ort gespeichert!)")
         print("    [o]   Auto-Shifter starten / pausieren")
         print("    [p]   Skript sauber beenden")
-        print("=" * 74)
-        print("  Bereit! Bewege die Maus über den grauen Kreis und drücke [i],")
-        print("  oder drücke direkt [o], um den Auto-Shifter zu starten.\n", flush=True)
+        print("=" * 76, flush=True)
 
     def run(self) -> None:
-        """Startet den Überwachungs-Thread und den globalen Hotkey-Listener."""
-        self.print_banner()
+        """Startet den Überwachungs-Thread, den Konsole-Fallback und den globalen Hotkey-Listener."""
+        screen_ok, listen_ok, post_ok = check_and_request_macos_permissions()
+        self.print_banner(screen_ok, listen_ok, post_ok)
+
+        # Falls Berechtigungen fehlen, öffne optional direkt die passende macOS-Systemeinstellung
+        if not (listen_ok and post_ok):
+            try:
+                subprocess.run(
+                    [
+                        "open",
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                    ],
+                    check=False,
+                )
+            except Exception:
+                pass
 
         worker = threading.Thread(target=self.monitor_loop, name="ShiftMonitorThread", daemon=True)
         worker.start()
 
+        stdin_worker = threading.Thread(
+            target=self.stdin_fallback_loop, name="StdinHotkeyThread", daemon=True
+        )
+        stdin_worker.start()
+
         def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> bool | None:
             try:
+                cmd: str | None = None
                 char = getattr(key, "char", None)
-                if isinstance(char, str):
-                    char_lower = char.lower()
-                    if char_lower == "i":
-                        self.calibrate_at_mouse()
-                    elif char_lower == "o":
-                        self.toggle_active()
-                    elif char_lower == "p":
-                        self.stop()
+                if isinstance(char, str) and char.lower() in ("i", "o", "p"):
+                    cmd = char.lower()
+                else:
+                    vk = getattr(key, "vk", None)
+                    if isinstance(vk, int) and vk in MACOS_VK_MAP:
+                        cmd = MACOS_VK_MAP[vk]
+
+                if cmd is not None:
+                    if self.handle_command(cmd):
                         return False  # Beendet den pynput-Listener
             except Exception as exc:
                 print(f"[FEHLER] Hotkey-Verarbeitung: {exc}", file=sys.stderr, flush=True)
@@ -365,7 +528,9 @@ class AutoShifter:
 
         try:
             with keyboard.Listener(on_press=on_press) as listener:
-                listener.join()
+                while self.running and listener.is_alive():
+                    time.sleep(0.1)
+                listener.stop()
         except KeyboardInterrupt:
             self.stop()
 
