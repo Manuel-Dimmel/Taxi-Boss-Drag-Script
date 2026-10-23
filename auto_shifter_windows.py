@@ -12,10 +12,12 @@ Hotkeys (Windows):
 - [o]       Bot starten / pausieren (mit automatischem Safety-Release für W & E)
 - [p]       Skript sauber beenden (mit garantiertem Safety-Release für W & E)
 - [m]       Modus wechseln: Vollautomatik-Bot (`FULL_AUTO`) <-> Nur Auto-Shifter (`SHIFT_ONLY`)
-- [i] / [1] Kalibriere `Shift_Point` (kleiner Kreis im Tacho für E)
-- [2]       Kalibriere `Needle_Target_Point` (weiße Tachonadel zwischen 4 und 5)
-- [3]       Kalibriere `Traffic_Light_Point` (Ampel-Box oben in der Mitte)
-- [4]       Kalibriere `Continue_Button_Point` (grüner WEITER-Button im End-Popup)
+- [i] / [1] Kalibriere `shift_point` (kleiner Kreis im Tacho für E)
+- [2]       Kalibriere `needle_target_point` (weiße Tachonadel zwischen 4 und 5)
+- [3]       Kalibriere `traffic_light_point` (Ampel-Box oben in der Mitte)
+- [4]       Kalibriere `weiter_button` (grüner WEITER-Button in Popup 1 / Rennstatistik)
+- [5]       Kalibriere `next_stage_button` (grüner NEXT STAGE-Button in Popup 2 / Ladder)
+- [6]       Kalibriere `rennen_button` (grüner RENNEN-Button in Popup 3 / VS-Screen)
 """
 
 from __future__ import annotations
@@ -49,12 +51,16 @@ if IS_WINDOWS:
 from pynput import keyboard, mouse
 
 from core_utils import (
+    MENU_CLICK_COOLDOWN,
+    TAP_COOLDOWN,
+    TAP_DURATION,
     ConfigManager,
     DragRaceStateMachine,
     InputDriver,
     ScreenCaptureManager,
     create_mss_instance,
     is_continue_button_green,
+    is_green_button,
     is_needle_white,
     is_shift_green,
     is_traffic_light_present,
@@ -79,14 +85,16 @@ KEYEVENTF_SCANCODE: int = 0x0008
 KEYEVENTF_KEYUP: int = 0x0002
 
 WIN_VK_HOTKEYS: Dict[int, str] = {
-    0x49: "i",  # VK_I
-    0x4F: "o",  # VK_O
-    0x50: "p",  # VK_P
-    0x4D: "m",  # VK_M
-    0x31: "1",  # VK_1
-    0x32: "2",  # VK_2
-    0x33: "3",  # VK_3
-    0x34: "4",  # VK_4
+    0x49: "i",  # VK_I -> shift_point
+    0x4F: "o",  # VK_O -> Start / Pause
+    0x50: "p",  # VK_P -> Beenden
+    0x4D: "m",  # VK_M -> Modus wechseln
+    0x31: "1",  # VK_1 -> shift_point
+    0x32: "2",  # VK_2 -> needle_target_point
+    0x33: "3",  # VK_3 -> traffic_light_point
+    0x34: "4",  # VK_4 -> weiter_button
+    0x35: "5",  # VK_5 -> next_stage_button
+    0x36: "6",  # VK_6 -> rennen_button
 }
 
 if IS_WINDOWS:
@@ -236,11 +244,13 @@ class WindowsDragBotApp:
     """Verbindet `DragRaceStateMachine`, `ConfigManager` und Windows-Hotkeys."""
 
     CALIBRATION_MAP: Dict[str, Tuple[str, str]] = {
-        "1": ("shift_point", "Shift_Point (Kleiner Kreis im Tacho für E)"),
-        "i": ("shift_point", "Shift_Point (Kleiner Kreis im Tacho für E)"),
-        "2": ("needle_target_point", "Needle_Target_Point (Weiße Tachonadel zwischen 4 und 5)"),
-        "3": ("traffic_light_point", "Traffic_Light_Point (Ampel-Box oben in der Mitte)"),
-        "4": ("continue_button_point", "Continue_Button_Point (Grüner WEITER-Button im Popup)"),
+        "1": ("shift_point", "shift_point (Kleiner Kreis im Tacho für E)"),
+        "i": ("shift_point", "shift_point (Kleiner Kreis im Tacho für E)"),
+        "2": ("needle_target_point", "needle_target_point (Weiße Tachonadel zwischen 4 und 5)"),
+        "3": ("traffic_light_point", "traffic_light_point (Ampel-Box oben in der Mitte)"),
+        "4": ("weiter_button", "weiter_button (Grüner WEITER-Button in Popup 1 / Rennstatistik)"),
+        "5": ("next_stage_button", "next_stage_button (Grüner NEXT STAGE-Button unten rechts in Popup 2 / Ladder)"),
+        "6": ("rennen_button", "rennen_button (Grüner RENNEN-Button unten rechts neben CASH OUT in Popup 3)"),
     }
 
     def __init__(self) -> None:
@@ -295,9 +305,9 @@ class WindowsDragBotApp:
             )
         else:
             status = (
-                "WEITER-Grün erkannt!"
-                if is_continue_button_green(r, g, b)
-                else "Position gespeichert (Bereit für grünen WEITER-Button)"
+                f"GRÜNER BUTTON erkannt! ({point_name})"
+                if is_green_button(r, g, b)
+                else f"Position gespeichert (Bereit für grünen Button: {point_name})"
             )
 
         print(
@@ -331,7 +341,7 @@ class WindowsDragBotApp:
         """Optionaler Konsolen-Fallback unter Windows (msvcrt)."""
         if msvcrt is None:
             return
-        valid_cmds = ("o", "p", "m", "i", "1", "2", "3", "4")
+        valid_cmds = ("o", "p", "m", "i", "1", "2", "3", "4", "5", "6")
         try:
             while self.bot.running:
                 if msvcrt.kbhit():
@@ -352,22 +362,30 @@ class WindowsDragBotApp:
         print("=" * 80)
         print(f"  Bildschirm-Auflösung:     {w} x {h} Pixel (DPI-Aware 1:1)")
         print(f"  Konfigurationsdatei:      {self.config.config_path}")
-        print(f"  Aktiver Modus:            {self.bot.mode.value} (Vollautomatik: Ampel -> Rennen -> Popup)")
+        print(f"  Aktiver Modus:            {self.bot.mode.value} (Vollautomatik: Ampel -> Rennen -> 3-Stufen-Menü)")
+        print(
+            f"  Micro-Tap-Timings (W):    TAP_DURATION={TAP_DURATION * 1000:.0f} ms | "
+            f"TAP_COOLDOWN={TAP_COOLDOWN * 1000:.0f} ms | MENU_CLICK_COOLDOWN={MENU_CLICK_COOLDOWN:.2f} s"
+        )
         print("-" * 80)
         print("  Aktuelle Koordinaten (Pixel):")
-        print(f"    [1 / i] Shift_Point (Kreis für E):         {self.bot.shift_pt}")
-        print(f"    [2]     Needle_Target_Point (Nadel 4–5):   {self.bot.needle_pt}")
-        print(f"    [3]     Traffic_Light_Point (Ampel oben):  {self.bot.light_pt}")
-        print(f"    [4]     Continue_Button_Point (WEITER):    {self.bot.continue_pt}")
+        print(f"    [1 / i] shift_point (Kreis für E):         {self.bot.shift_pt}")
+        print(f"    [2]     needle_target_point (Nadel 4–5):   {self.bot.needle_pt}")
+        print(f"    [3]     traffic_light_point (Ampel oben):  {self.bot.light_pt}")
+        print(f"    [4]     weiter_button (Popup 1 WEITER):    {self.bot.weiter_pt}")
+        print(f"    [5]     next_stage_button (Popup 2 NEXT):  {self.bot.next_stage_pt}")
+        print(f"    [6]     rennen_button (Popup 3 RENNEN):    {self.bot.rennen_pt}")
         print("-" * 80)
         print("  Steuerung per Hotkeys:")
         print("    [o]       Bot STARTEN / PAUSIEREN (inkl. Safety-Release für W & E)")
         print("    [p]       Skript SAUBER BEENDEN   (inkl. Safety-Release für W & E)")
         print("    [m]       Modus wechseln: FULL_AUTO (Renn-Bot) <-> SHIFT_ONLY (Nur Schalten)")
-        print("    [1] / [i] Mausposition als Shift_Point speichern")
-        print("    [2]       Mausposition als Needle_Target_Point (zwischen 4 & 5) speichern")
-        print("    [3]       Mausposition als Traffic_Light_Point (Ampel oben) speichern")
-        print("    [4]       Mausposition als Continue_Button_Point (WEITER-Button) speichern")
+        print("    [1] / [i] Mausposition als shift_point (Kreis im Tacho für E) speichern")
+        print("    [2]       Mausposition als needle_target_point (Tachonadel zwischen 4 & 5) speichern")
+        print("    [3]       Mausposition als traffic_light_point (Ampel-Box oben) speichern")
+        print("    [4]       Mausposition als weiter_button (Grüner WEITER-Button in Popup 1) speichern")
+        print("    [5]       Mausposition als next_stage_button (Grüner NEXT STAGE-Button in Popup 2) speichern")
+        print("    [6]       Mausposition als rennen_button (Grüner RENNEN-Button in Popup 3) speichern")
         print("=" * 80)
         print("  Bereit! Drücke [o], um den vollautomatischen Renn-Bot zu starten.\n", flush=True)
 
@@ -384,7 +402,7 @@ class WindowsDragBotApp:
             )
             console_worker.start()
 
-        valid_chars = {"o", "p", "m", "i", "1", "2", "3", "4"}
+        valid_chars = {"o", "p", "m", "i", "1", "2", "3", "4", "5", "6"}
 
         def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> bool | None:
             try:
@@ -398,7 +416,7 @@ class WindowsDragBotApp:
                         cmd = WIN_VK_HOTKEYS[vk]
 
                 if cmd is not None:
-                    if cmd in ("1", "2", "3", "4") and self.bot.active:
+                    if cmd in ("1", "2", "3", "4", "5", "6") and self.bot.active:
                         return None
                     if self.handle_command(cmd):
                         return False

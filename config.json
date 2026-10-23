@@ -1,45 +1,63 @@
 {
   "points": {
     "shift_point": {
-      "rel_x": 0.09883,
-      "rel_y": 0.439024,
-      "description": "Kleiner Kreis im Tacho für Up-Shift [E]",
+      "rel_x": 0.5,
+      "rel_y": 0.778681,
       "last_logical": [
-        169,
-        486
-      ]
+        855,
+        862
+      ],
+      "description": "Kleiner Kreis im Tacho für Up-Shift [E]"
     },
     "needle_target_point": {
-      "rel_x": 0.481871,
-      "rel_y": 0.766938,
-      "description": "Zielpunkt für weiße Tachonadel zwischen 4 und 5 (Blaue Zone)",
+      "rel_x": 1.087719,
+      "rel_y": 0.496838,
       "last_logical": [
-        824,
-        849
-      ]
+        1860,
+        550
+      ],
+      "description": "Zielpunkt für weiße Tachonadel zwischen 4 und 5 (Blaue Zone)"
     },
     "traffic_light_point": {
-      "rel_x": 0.502339,
-      "rel_y": 0.158988,
+      "rel_x": 0.5,
+      "rel_y": 0.207769,
       "ref_rgb": [
-        73,
-        60,
-        67
+        54,
+        54,
+        58
       ],
-      "description": "Punkt auf der dunklen Ampel-Box oben in der Mitte",
       "last_logical": [
-        859,
-        176
-      ]
+        855,
+        230
+      ],
+      "description": "Punkt auf der dunklen Ampel-Box oben in der Mitte"
     },
-    "continue_button_point": {
-      "rel_x": 0.09883,
-      "rel_y": 0.439024,
-      "description": "Punkt auf dem grünen WEITER-Button im End-Popup",
+    "weiter_button": {
+      "rel_x": 0.5,
+      "rel_y": 0.760614,
       "last_logical": [
-        169,
-        486
-      ]
+        855,
+        842
+      ],
+      "description": "Menü 1/3: Grüner WEITER-Button im Rennstatistik-Popup"
+    },
+    "next_stage_button": {
+      "rel_x": 0.897661,
+      "rel_y": 0.924119,
+      "last_logical": [
+        1535,
+        1023
+      ],
+      "description": "Menü 2/3: Grüner NEXT STAGE-Button im Taxi City Ladder-Popup"
+    },
+    "rennen_button": {
+      "rel_x": 0.683626,
+      "rel_y": 0.832882,
+      "last_logical": [
+        1169,
+        922
+      ],
+      "description": "Menü 3/3: Grüner RENNEN-Button im VS-Screen nach der Cutscene"
     }
   },
   "thresholds": {
@@ -53,12 +71,14 @@
     "traffic_light_tolerance": 24
   },
   "timings": {
+    "tap_duration": 0.018,
+    "tap_cooldown": 0.02,
     "key_hold_duration": 0.012,
     "min_shift_cooldown": 0.085,
     "max_shift_cooldown": 0.22,
-    "needle_pulse_hold": 0.022,
-    "needle_release_pause": 0.012,
-    "popup_click_interval": 0.55,
+    "needle_pulse_hold": 0.018,
+    "needle_release_pause": 0.02,
+    "popup_click_interval": 0.5,
     "scan_interval": 0.0
   }
 }

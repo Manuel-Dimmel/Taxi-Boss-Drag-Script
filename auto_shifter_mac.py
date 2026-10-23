@@ -9,30 +9,34 @@ pynput) bereit.
 
 Ablauf der 3 Phasen im Vollautomatik-Modus (`FULL_AUTO`):
 ---------------------------------------------------------
-1. Phase 1 (`WAITING_AT_LIGHT` – Referenz: Bildschirmfoto 13.53.03):
-   - Erkennt die dunkle Ampel-Box oben in der Mitte (`Traffic_Light_Point`).
-   - Regelt die Taste `w` per schnellem PWM/Feathering so, dass die weiße
-     Tachonadel am `Needle_Target_Point` im blauen Bereich zwischen 4 und 5
+1. Phase 1 (`STAGE_1_LAUNCH` – Referenz: Bildschirmfoto 13.53.03):
+   - Erkennt die dunkle Ampel-Box oben in der Mitte (`traffic_light_point`).
+   - Regelt die Taste `w` per präzisen Micro-Taps (`TAP_DURATION` / `TAP_COOLDOWN`) so,
+     dass die weiße Tachonadel am `needle_target_point` im blauen Bereich zwischen 4 und 5
      gehalten wird (sobald weiße Pixel erkannt werden -> sofort `release('w')`).
-2. Phase 2 (`RACING` – Referenz: Bildschirmfoto 09.32.46):
-   - Sobald die Ampel-Box verschwindet (`GO!`), wird `w` durchgehend gehalten.
-   - Überwacht `Shift_Point` mit ~120 Hz und drückt sofort `e`, sobald der
+2. Phase 2 (`STAGE_2_RACING` – Referenz: Bildschirmfoto 09.32.46):
+   - Sobald die Ampel-Box verschwindet (`GO!`), wird `w` durchgehend gehalten (`press('w')`).
+   - Überwacht `shift_point` mit ~120 Hz und drückt sofort `e`, sobald der
      Schalt-Kreis grün wird (inkl. dynamischem 85–220 ms Cooldown für Gang 1 & 2).
-3. Phase 3 (`POST_RACE_POPUP` – Referenz: Bildschirmfoto 13.58.00):
-   - Sobald der grüne `WEITER`-Button (`Continue_Button_Point`) erscheint, wird
-     `w` sofort losgelassen (`release('w')`).
-   - Klickt automatisch auf `WEITER` und wechselt zurück in Phase 1, sobald die
-     Ampel für das nächste Rennen erscheint.
+3. Phase 3 (`STAGE_3_MENU_LOOP` – Referenzen: Popups 1–3):
+   - Sobald im Ziel einer der grünen Menü-Buttons erscheint, wird `w` sofort losgelassen.
+   - Klickt im 3-Stufen-Loop automatisch auf:
+     1) `weiter_button` (Grüner WEITER-Button in der Rennstatistik)
+     2) `next_stage_button` (Grüner NEXT STAGE-Button unten rechts in der Taxi City Ladder)
+     3) `rennen_button` (Grüner RENNEN-Button unten rechts neben CASH OUT im VS-Screen)
+   - Wechselt automatisch zurück in Phase 1, sobald die Ampel für das nächste Rennen erscheint.
 
 Hotkeys (macOS):
 ----------------
 - [o]       Bot starten / pausieren (mit automatischem Safety-Release für W & E)
 - [p]       Skript sauber beenden (mit garantiertem Safety-Release für W & E)
 - [m]       Modus wechseln: Vollautomatik-Bot (`FULL_AUTO`) <-> Nur Auto-Shifter (`SHIFT_ONLY`)
-- [i] / [1] Kalibriere `Shift_Point` (kleiner Kreis im Tacho für E)
-- [2]       Kalibriere `Needle_Target_Point` (weiße Tachonadel zwischen 4 und 5)
-- [3]       Kalibriere `Traffic_Light_Point` (Ampel-Box oben in der Mitte)
-- [4]       Kalibriere `Continue_Button_Point` (grüner WEITER-Button im End-Popup)
+- [i] / [1] Kalibriere `shift_point` (kleiner Kreis im Tacho für E)
+- [2]       Kalibriere `needle_target_point` (weiße Tachonadel zwischen 4 und 5)
+- [3]       Kalibriere `traffic_light_point` (Ampel-Box oben in der Mitte)
+- [4]       Kalibriere `weiter_button` (grüner WEITER-Button im Statistik-Popup)
+- [5]       Kalibriere `next_stage_button` (grüner NEXT STAGE-Button in der Ladder)
+- [6]       Kalibriere `rennen_button` (grüner RENNEN-Button neben CASH OUT)
 """
 
 from __future__ import annotations
@@ -51,12 +55,16 @@ from typing import Dict, Tuple
 from pynput import keyboard, mouse
 
 from core_utils import (
+    MENU_CLICK_COOLDOWN,
+    TAP_COOLDOWN,
+    TAP_DURATION,
     ConfigManager,
     DragRaceStateMachine,
     InputDriver,
     ScreenCaptureManager,
     create_mss_instance,
     is_continue_button_green,
+    is_green_button,
     is_needle_white,
     is_shift_green,
     is_traffic_light_present,
@@ -86,14 +94,16 @@ MACOS_VK_W: int = 13  # Taste 'w'
 MACOS_VK_E: int = 14  # Taste 'e'
 
 MACOS_VK_HOTKEYS: Dict[int, str] = {
-    34: "i",  # 'i' -> Shift_Point kalibrieren
+    34: "i",  # 'i' -> shift_point kalibrieren
     31: "o",  # 'o' -> Start / Pause
     35: "p",  # 'p' -> Beenden
     46: "m",  # 'm' -> Modus wechseln (Full-Auto <-> Shift-Only)
-    18: "1",  # '1' -> Shift_Point kalibrieren
-    19: "2",  # '2' -> Needle_Target_Point kalibrieren
-    20: "3",  # '3' -> Traffic_Light_Point kalibrieren
-    21: "4",  # '4' -> Continue_Button_Point kalibrieren
+    18: "1",  # '1' -> shift_point kalibrieren
+    19: "2",  # '2' -> needle_target_point kalibrieren
+    20: "3",  # '3' -> traffic_light_point kalibrieren
+    21: "4",  # '4' -> weiter_button kalibrieren
+    23: "5",  # '5' -> next_stage_button kalibrieren
+    22: "6",  # '6' -> rennen_button kalibrieren
 }
 
 
@@ -223,17 +233,29 @@ class MacInputDriver(InputDriver):
 
     def click_at(self, logical_x: int, logical_y: int) -> None:
         """
-        Bewegt den Mauszeiger zum Zielpunkt (inkl. minimalem Hover-Impuls für Roblox UI)
-        und führt einen zuverlässigen Linksklick aus.
+        Bewegt den Mauszeiger zum Zielpunkt (inkl. CGWarpMouseCursorPosition und
+        minimalem Hover-Impuls für Roblox UI) und führt einen zuverlässigen Linksklick aus.
         """
         if Quartz is not None:
             try:
                 pt_hover = Quartz.CGPoint(float(logical_x + 1), float(logical_y))
                 pt = Quartz.CGPoint(float(logical_x), float(logical_y))
 
+                if hasattr(Quartz, "CGAssociateMouseAndMouseCursorPosition"):
+                    Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+
+                if hasattr(Quartz, "CGWarpMouseCursorPosition"):
+                    Quartz.CGWarpMouseCursorPosition(pt_hover)
+
                 move1 = Quartz.CGEventCreateMouseEvent(
                     None, Quartz.kCGEventMouseMoved, pt_hover, Quartz.kCGMouseButtonLeft
                 )
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, move1)
+                time.sleep(0.010)
+
+                if hasattr(Quartz, "CGWarpMouseCursorPosition"):
+                    Quartz.CGWarpMouseCursorPosition(pt)
+
                 move2 = Quartz.CGEventCreateMouseEvent(
                     None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft
                 )
@@ -244,8 +266,6 @@ class MacInputDriver(InputDriver):
                     None, Quartz.kCGEventLeftMouseUp, pt, Quartz.kCGMouseButtonLeft
                 )
 
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, move1)
-                time.sleep(0.010)
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, move2)
                 time.sleep(0.015)
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
@@ -255,6 +275,8 @@ class MacInputDriver(InputDriver):
             except Exception:
                 pass
 
+        self.mouse_ctrl.position = (logical_x + 1, logical_y)
+        time.sleep(0.010)
         self.mouse_ctrl.position = (logical_x, logical_y)
         time.sleep(0.015)
         self.mouse_ctrl.press(mouse.Button.left)
@@ -288,11 +310,13 @@ class MacDragBotApp:
     """Verbindet `DragRaceStateMachine`, `ConfigManager` und macOS-Hotkeys."""
 
     CALIBRATION_MAP: Dict[str, Tuple[str, str]] = {
-        "1": ("shift_point", "Shift_Point (Kleiner Kreis im Tacho für E)"),
-        "i": ("shift_point", "Shift_Point (Kleiner Kreis im Tacho für E)"),
-        "2": ("needle_target_point", "Needle_Target_Point (Weiße Tachonadel zwischen 4 und 5)"),
-        "3": ("traffic_light_point", "Traffic_Light_Point (Ampel-Box oben in der Mitte)"),
-        "4": ("continue_button_point", "Continue_Button_Point (Grüner WEITER-Button im Popup)"),
+        "1": ("shift_point", "shift_point (Kleiner Kreis im Tacho für E)"),
+        "i": ("shift_point", "shift_point (Kleiner Kreis im Tacho für E)"),
+        "2": ("needle_target_point", "needle_target_point (Weiße Tachonadel zwischen 4 und 5)"),
+        "3": ("traffic_light_point", "traffic_light_point (Ampel-Box oben in der Mitte)"),
+        "4": ("weiter_button", "weiter_button (Grüner WEITER-Button in Popup 1 / Rennstatistik)"),
+        "5": ("next_stage_button", "next_stage_button (Grüner NEXT STAGE-Button unten rechts in Popup 2 / Ladder)"),
+        "6": ("rennen_button", "rennen_button (Grüner RENNEN-Button unten rechts neben CASH OUT in Popup 3)"),
     }
 
     def __init__(self) -> None:
@@ -360,9 +384,9 @@ class MacDragBotApp:
             )
         else:
             status = (
-                "WEITER-Grün erkannt!"
-                if is_continue_button_green(r, g, b)
-                else "Position gespeichert (Bereit für grünen WEITER-Button)"
+                f"GRÜNER BUTTON erkannt! ({point_name})"
+                if is_green_button(r, g, b)
+                else f"Position gespeichert (Bereit für grünen Button: {point_name})"
             )
 
         print(
@@ -401,7 +425,7 @@ class MacDragBotApp:
         fd = None
         old_settings = None
         is_tty = False
-        valid_cmds = ("o", "p", "m", "i", "1", "2", "3", "4")
+        valid_cmds = ("o", "p", "m", "i", "1", "2", "3", "4", "5", "6")
 
         try:
             fd = sys.stdin.fileno()
@@ -448,7 +472,9 @@ class MacDragBotApp:
         s_pt = self.bot.shift_pt
         n_pt = self.bot.needle_pt
         l_pt = self.bot.light_pt
-        c_pt = self.bot.continue_pt
+        w_pt = self.bot.weiter_pt
+        ns_pt = self.bot.next_stage_pt
+        r_pt = self.bot.rennen_pt
 
         print("=" * 80)
         print("  TAXI BOSS (ROBLOX) – VOLLAUTOMATISCHER RENN-BOT FÜR macOS")
@@ -456,13 +482,19 @@ class MacDragBotApp:
         print(f"  Bildschirm (Logisch):     {lw} x {lh} Punkte (pynput)")
         print(f"  Bildschirm (Retina):      {pw} x {ph} Pixel (Skalierung {self.capture.retina_scale:.1f}x)")
         print(f"  Konfigurationsdatei:      {self.config.config_path}")
-        print(f"  Aktiver Modus:            {self.bot.mode.value} (Vollautomatik: Ampel -> Rennen -> Popup)")
+        print(f"  Aktiver Modus:            {self.bot.mode.value} (Vollautomatik: Ampel -> Rennen -> 3-Stufen-Menü)")
+        print(
+            f"  Micro-Tap-Timings (W):    TAP_DURATION={TAP_DURATION * 1000:.0f} ms | "
+            f"TAP_COOLDOWN={TAP_COOLDOWN * 1000:.0f} ms | MENU_CLICK_COOLDOWN={MENU_CLICK_COOLDOWN:.2f} s"
+        )
         print("-" * 80)
         print("  Aktuelle Koordinaten (Logisch | Retina):")
-        print(f"    [1 / i] Shift_Point (Kreis für E):         {s_pt} | {self.capture.to_physical_coords(*s_pt)}")
-        print(f"    [2]     Needle_Target_Point (Nadel 4–5):   {n_pt} | {self.capture.to_physical_coords(*n_pt)}")
-        print(f"    [3]     Traffic_Light_Point (Ampel oben):  {l_pt} | {self.capture.to_physical_coords(*l_pt)}")
-        print(f"    [4]     Continue_Button_Point (WEITER):    {c_pt} | {self.capture.to_physical_coords(*c_pt)}")
+        print(f"    [1 / i] shift_point (Kreis für E):         {s_pt} | {self.capture.to_physical_coords(*s_pt)}")
+        print(f"    [2]     needle_target_point (Nadel 4–5):   {n_pt} | {self.capture.to_physical_coords(*n_pt)}")
+        print(f"    [3]     traffic_light_point (Ampel oben):  {l_pt} | {self.capture.to_physical_coords(*l_pt)}")
+        print(f"    [4]     weiter_button (Popup 1 WEITER):    {w_pt} | {self.capture.to_physical_coords(*w_pt)}")
+        print(f"    [5]     next_stage_button (Popup 2 NEXT):  {ns_pt} | {self.capture.to_physical_coords(*ns_pt)}")
+        print(f"    [6]     rennen_button (Popup 3 RENNEN):    {r_pt} | {self.capture.to_physical_coords(*r_pt)}")
         print("-" * 80)
         print("  macOS-Berechtigungsstatus:")
         print(f"    - Bildschirmaufnahme (mss):           {'OK' if screen_ok else 'FEHLT!'}")
@@ -473,10 +505,12 @@ class MacDragBotApp:
         print("    [o]       Bot STARTEN / PAUSIEREN (inkl. Safety-Release für W & E)")
         print("    [p]       Skript SAUBER BEENDEN   (inkl. Safety-Release für W & E)")
         print("    [m]       Modus wechseln: FULL_AUTO (Renn-Bot) <-> SHIFT_ONLY (Nur Schalten)")
-        print("    [1] / [i] Mausposition als Shift_Point speichern")
-        print("    [2]       Mausposition als Needle_Target_Point (zwischen 4 & 5) speichern")
-        print("    [3]       Mausposition als Traffic_Light_Point (Ampel oben) speichern")
-        print("    [4]       Mausposition als Continue_Button_Point (WEITER-Button) speichern")
+        print("    [1] / [i] Mausposition als shift_point (Kreis im Tacho für E) speichern")
+        print("    [2]       Mausposition als needle_target_point (Tachonadel zwischen 4 & 5) speichern")
+        print("    [3]       Mausposition als traffic_light_point (Ampel-Box oben) speichern")
+        print("    [4]       Mausposition als weiter_button (Grüner WEITER-Button in Popup 1) speichern")
+        print("    [5]       Mausposition als next_stage_button (Grüner NEXT STAGE-Button in Popup 2) speichern")
+        print("    [6]       Mausposition als rennen_button (Grüner RENNEN-Button in Popup 3) speichern")
         print("=" * 80)
         print("  Bereit! Drücke [o], um den vollautomatischen Renn-Bot zu starten.\n", flush=True)
 
@@ -505,7 +539,7 @@ class MacDragBotApp:
         )
         stdin_worker.start()
 
-        valid_chars = {"o", "p", "m", "i", "1", "2", "3", "4"}
+        valid_chars = {"o", "p", "m", "i", "1", "2", "3", "4", "5", "6"}
 
         def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> bool | None:
             try:
@@ -519,9 +553,9 @@ class MacDragBotApp:
                         cmd = MACOS_VK_HOTKEYS[vk]
 
                 if cmd is not None:
-                    # Kalibrierungstasten 1-4 während aktiver Fahrt ignorieren, falls versehentlich gedrückt,
+                    # Kalibrierungstasten 1-6 während aktiver Fahrt ignorieren, falls versehentlich gedrückt,
                     # außer der Bot ist pausiert oder 'i' wird gedrückt.
-                    if cmd in ("1", "2", "3", "4") and self.bot.active:
+                    if cmd in ("1", "2", "3", "4", "5", "6") and self.bot.active:
                         return None
                     if self.handle_command(cmd):
                         return False
