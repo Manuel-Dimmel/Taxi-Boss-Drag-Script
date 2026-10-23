@@ -61,7 +61,7 @@ except ImportError:
 
 
 # ============================================================================
-# KONFIGURATION & SCHWELLENWERTE
+# KONFIGURATION & SCHWELLENWERTE (OPTIMIERT FÜR GANG 1 & 2)
 # ============================================================================
 
 # Relative Standard-Position aus der Screenshot-Analyse (Schalt-Indikator-Kreis)
@@ -71,21 +71,25 @@ DEFAULT_REL_Y: float = 0.7787  # 1724 / 2214 (Schalt-Kreis im Tacho)
 # Überwachungsbereich rund um die Zielkoordinate (3x3 Bereich)
 SAMPLE_BOX_SIZE: int = 3
 
-# Schwellenwert-Logik für Grün-Erkennung (mit Toleranz)
-GREEN_MIN_VALUE: int = 140
-GREEN_DOMINANCE_RATIO: float = 1.35  # G > R * 1.35 und G > B * 1.35
+# Schwellenwert-Logik für Grün-Erkennung:
+# Etwas sensibler eingestellt (G > 95 statt 140), damit bereits der allererste
+# Übergangs-Frame von Grau RGB(50,50,50) zu Grün im 1. und 2. Gang sofort auslöst!
+GREEN_MIN_VALUE: int = 95
+GREEN_DOMINANCE_RATIO: float = 1.22  # G > R * 1.22 und G > B * 1.22
 
-# Timing-Parameter
-KEY_HOLD_DURATION: float = 0.035  # Kurze Haltedauer (35 ms), damit Roblox die Eingabe sicher erkennt
-SHIFT_COOLDOWN: float = 0.25      # 0.25 s Entprellung nach jedem Schaltvorgang
-SCAN_INTERVAL: float = 0.004      # ~250 Hz Scan-Schleife für minimale Latenz
+# Timing-Parameter (Ultra-Low-Latency für schnelle erste Gänge):
+KEY_HOLD_DURATION: float = 0.012  # 12 ms Tastendruck (schnellstmögliche Registrierung in Roblox)
+MIN_SHIFT_COOLDOWN: float = 0.085 # 85 ms Mindest-Pause, damit der 2. Gang nicht verschlafen wird
+MAX_SHIFT_COOLDOWN: float = 0.22  # Max. Wartezeit, falls der Kreis länger grün bleibt
+SCAN_INTERVAL: float = 0.0        # 0.0 s Zusatzpause -> volle 120 Hz Synchronisation mit macOS WindowServer
 
-# macOS Virtual KeyCodes für i, o, p (falls key.char in Roblox/Vollbild leer ist)
+# macOS Virtual KeyCodes für i, o, p + e
 MACOS_VK_MAP: dict[int, str] = {
     34: "i",  # Taste 'i'
     31: "o",  # Taste 'o'
     35: "p",  # Taste 'p'
 }
+MACOS_VK_E: int = 14  # Physischer Keycode für 'e' auf macOS
 
 
 def create_mss_instance() -> Any:
@@ -112,7 +116,6 @@ def check_and_request_macos_permissions() -> Tuple[bool, bool, bool]:
       1. Bildschirmaufnahme (Screen Recording) -> für mss
       2. Eingabeüberwachung (Input Monitoring) -> für globale Hotkeys (i, o, p)
       3. Bedienungshilfen (Accessibility)      -> für automatisches Drücken von 'e'
-    Falls Berechtigungen fehlen, wird der macOS-Systemdialog angefordert.
     """
     screen_ok = True
     listen_ok = True
@@ -191,13 +194,16 @@ class AutoShifter:
         # Vorausgewählte logische Koordinate anhand der Vorab-Analyse setzen
         self.target_logical_x: int = int(round(self.logical_width * DEFAULT_REL_X))
         self.target_logical_y: int = int(round(self.logical_height * DEFAULT_REL_Y))
+        self._cached_bbox: dict[str, int] = self._build_capture_bbox(
+            self.target_logical_x, self.target_logical_y
+        )
 
     @staticmethod
     def is_green(r: int, g: int, b: int) -> bool:
         """
         Prüft anhand der Schwellenwert-Logik, ob ein RGB-Wert als 'Grün'
         (optimaler Schaltzeitpunkt) gilt:
-        G > 140 sowie G > R * 1.35 und G > B * 1.35
+        G > 95 sowie G > R * 1.22 und G > B * 1.22
         """
         return (
             g > GREEN_MIN_VALUE
@@ -220,52 +226,50 @@ class AutoShifter:
             "height": SAMPLE_BOX_SIZE,
         }
 
+    def sample_region_fast(self, sct: Any, bbox: dict[str, int]) -> Tuple[Tuple[int, int, int], bool]:
+        """
+        Ultraschnelle Auswertung des 3x3-Bereichs direkt auf dem BGRA-Speicherpuffer.
+        """
+        sct_img = sct.grab(bbox)
+        raw: bytes = sct_img.raw
+
+        # Schnelle Prüfung über alle Pixel im 3x3-Überwachungsbereich
+        for offset in range(0, len(raw), 4):
+            g = raw[offset + 1]
+            if g > GREEN_MIN_VALUE:
+                b = raw[offset]
+                r = raw[offset + 2]
+                if g > (r * GREEN_DOMINANCE_RATIO) and g > (b * GREEN_DOMINANCE_RATIO):
+                    return (r, g, b), True
+
+        # Falls nicht grün: Zentrumspixel für Diagnose/Kalibrierung zurückgeben
+        width: int = sct_img.width
+        height: int = sct_img.height
+        center_offset = ((height // 2) * width + (width // 2)) * 4
+        return (raw[center_offset + 2], raw[center_offset + 1], raw[center_offset]), False
+
     def sample_region(
         self, sct: Any, logical_x: int, logical_y: int
     ) -> Tuple[Tuple[int, int, int], bool]:
-        """
-        Liest den 3x3-Bereich um (logical_x, logical_y) direkt aus dem BGRA-Rohpuffer aus.
-        Gibt zurück:
-          - (R, G, B): Farbwert des erkannten grünen Pixels bzw. des Zentrumspixels
-          - is_green:  True, sobald mindestens ein Pixel im 3x3-Bereich den Grün-Schwellenwert erfüllt
-        """
+        """Komfort-Wrapper für Kalibrierung und Diagnose."""
         bbox = self._build_capture_bbox(logical_x, logical_y)
-        sct_img = sct.grab(bbox)
-
-        # Rohdaten liegen in mss als BGRA vor (4 Bytes pro Pixel)
-        raw: bytes = sct_img.raw
-        width: int = sct_img.width
-        height: int = sct_img.height
-
-        # Zentrumspixel für die Kontrollausgabe im Terminal bestimmen
-        cx = width // 2
-        cy = height // 2
-        center_offset = (cy * width + cx) * 4
-        center_b = raw[center_offset]
-        center_g = raw[center_offset + 1]
-        center_r = raw[center_offset + 2]
-        center_rgb = (center_r, center_g, center_b)
-
-        # Schnelle Iteration über alle Pixel im 3x3-Überwachungsbereich
-        total_bytes = len(raw)
-        for offset in range(0, total_bytes, 4):
-            b = raw[offset]
-            g = raw[offset + 1]
-            r = raw[offset + 2]
-            if (
-                g > GREEN_MIN_VALUE
-                and g > (r * GREEN_DOMINANCE_RATIO)
-                and g > (b * GREEN_DOMINANCE_RATIO)
-            ):
-                return (r, g, b), True
-
-        return center_rgb, False
+        return self.sample_region_fast(sct, bbox)
 
     def trigger_shift(self) -> None:
-        """Drückt die Taste 'e' kurz und lässt sie wieder los (macOS/Roblox-kompatibel)."""
-        self.kb_ctrl.press("e")
-        time.sleep(KEY_HOLD_DURATION)
-        self.kb_ctrl.release("e")
+        """
+        Sendet den Tastendruck 'e' mit minimaler Latenz direkt über Quartz CGEvents
+        (bzw. pynput als Fallback), damit keine Millisekunde im 1./2. Gang verloren geht.
+        """
+        if Quartz is not None:
+            down_evt = Quartz.CGEventCreateKeyboardEvent(None, MACOS_VK_E, True)
+            up_evt = Quartz.CGEventCreateKeyboardEvent(None, MACOS_VK_E, False)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down_evt)
+            time.sleep(KEY_HOLD_DURATION)
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up_evt)
+        else:
+            self.kb_ctrl.press("e")
+            time.sleep(KEY_HOLD_DURATION)
+            self.kb_ctrl.release("e")
 
     def calibrate_at_mouse(self) -> None:
         """
@@ -275,13 +279,15 @@ class AutoShifter:
         mx, my = self.mouse_ctrl.position
         logical_x = int(round(mx))
         logical_y = int(round(my))
+        new_bbox = self._build_capture_bbox(logical_x, logical_y)
 
         with self._lock:
             self.target_logical_x = logical_x
             self.target_logical_y = logical_y
+            self._cached_bbox = new_bbox
 
         with create_mss_instance() as sct:
-            rgb, detected_green = self.sample_region(sct, logical_x, logical_y)
+            rgb, detected_green = self.sample_region_fast(sct, new_bbox)
 
         phys_x = int(round(logical_x * self.retina_scale))
         phys_y = int(round(logical_y * self.retina_scale))
@@ -314,7 +320,7 @@ class AutoShifter:
         if state:
             print(
                 f"\n[STATUS - o] Auto-Shifter AKTIVIERT – "
-                f"Überwache Logisch ({tx}, {ty}) / Retina ({phys_tx}, {phys_ty}) ...",
+                f"Überwache Logisch ({tx}, {ty}) / Retina ({phys_tx}, {phys_ty}) mit 120 Hz ...",
                 flush=True,
             )
         else:
@@ -331,9 +337,7 @@ class AutoShifter:
 
     def handle_command(self, cmd: str) -> bool:
         """
-        Verarbeitet einen Hotkey-Befehl ('i', 'o', 'p') mit kurzer Entprellung (150 ms),
-        damit globaler Listener und Terminal-Listener nicht doppelt auslösen.
-        Gibt True zurück, wenn das Skript beendet werden soll.
+        Verarbeitet einen Hotkey-Befehl ('i', 'o', 'p') mit kurzer Entprellung (150 ms).
         """
         now = time.monotonic()
         with self._lock:
@@ -352,41 +356,58 @@ class AutoShifter:
 
     def monitor_loop(self) -> None:
         """
-        Hauptschleife für die Echtzeit-Farberkennung.
-        Nutzt eine dedizierte `mss`-Instanz im Worker-Thread für maximale Performance.
+        Hochgeschwindigkeits-Hauptschleife (~120 Hz, ohne künstliches Sleep-Delay):
+        1. Sobald Grün erkannt wird, wird SOFORT (vor jeder Terminal-Ausgabe) 'e' gedrückt.
+        2. Danach greift eine intelligente Entprellung: Nach nur 85 ms Mindestpause
+           wird sofort geprüft, wann der Kreis wieder grau wird (statt starr 250 ms
+           zu schlafen). Dadurch werden auch extrem schnelle Gangwechsel vom 1. in den
+           2. und 3. Gang rechtzeitig erwischt.
         """
         with create_mss_instance() as sct:
             while self.running:
-                with self._lock:
-                    is_active = self.active
-                    tx = self.target_logical_x
-                    ty = self.target_logical_y
-
-                if not is_active:
-                    time.sleep(0.03)
+                if not self.active:
+                    time.sleep(0.025)
                     continue
 
-                rgb, is_shift_ready = self.sample_region(sct, tx, ty)
+                bbox = self._cached_bbox
+                rgb, is_shift_ready = self.sample_region_fast(sct, bbox)
+
                 if is_shift_ready:
+                    # 1. SOFORT schalten – keine Zeit durch print() vor dem Tastendruck verlieren!
+                    shift_start = time.perf_counter()
                     self.trigger_shift()
                     self.shift_count += 1
+
+                    # 2. Terminal-Ausgabe während ohnehin die Mindest-Entprellung läuft
                     r, g, b = rgb
+                    tx, ty = self.target_logical_x, self.target_logical_y
                     timestamp = time.strftime("%H:%M:%S")
                     print(
                         f"[{timestamp}] SCHALTEN #{self.shift_count:02d} -> Taste 'e' gedrückt! "
-                        f"(Erkanntes Grün: RGB({r}, {g}, {b}) bei ({tx}, {ty}))",
+                        f"(RGB({r}, {g}, {b}) bei ({tx}, {ty}))",
                         flush=True,
                     )
-                    # Cooldown (Entprellung), damit keine Gänge übersprungen werden
-                    time.sleep(SHIFT_COOLDOWN)
-                else:
+
+                    # 3. Kurze Mindest-Entprellung (85 ms ab Schaltbeginn), damit Roblox den Gang wechselt
+                    elapsed = time.perf_counter() - shift_start
+                    if elapsed < MIN_SHIFT_COOLDOWN:
+                        time.sleep(MIN_SHIFT_COOLDOWN - elapsed)
+
+                    # 4. Dynamisches Warten bis der Kreis nach dem Schalten wieder grau ist
+                    #    (maximal bis MAX_SHIFT_COOLDOWN = 220 ms Gesamtdauer).
+                    #    Sobald er grau ist, ist das Skript SOFORT bereit für den nächsten Gang!
+                    while self.running and self.active:
+                        if (time.perf_counter() - shift_start) >= MAX_SHIFT_COOLDOWN:
+                            break
+                        _, still_green = self.sample_region_fast(sct, self._cached_bbox)
+                        if not still_green:
+                            break
+                elif SCAN_INTERVAL > 0.0:
                     time.sleep(SCAN_INTERVAL)
 
     def stdin_fallback_loop(self) -> None:
         """
-        Fallback-Tastatur-Listener direkt im Terminal / in der PyCharm-Konsole:
-        Funktioniert auch dann sofort, wenn macOS die globalen Eingabeüberwachungs-Rechte
-        für PyCharm/Terminal noch nicht freigegeben hat.
+        Fallback-Tastatur-Listener direkt im Terminal / in der PyCharm-Konsole.
         """
         if not sys.stdin or sys.stdin.closed:
             return
@@ -413,7 +434,6 @@ class AutoShifter:
                             if self.handle_command(ch):
                                 break
                 else:
-                    # PyCharm Run-Konsole (Zeilenpufferung: Buchstabe + Enter)
                     rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
                     if rlist:
                         line = sys.stdin.readline()
@@ -443,7 +463,7 @@ class AutoShifter:
             init_rgb, _ = self.sample_region(sct, self.target_logical_x, self.target_logical_y)
 
         print("=" * 76)
-        print("  TAXI BOSS (ROBLOX) – AUTO-SHIFTER FÜR macOS")
+        print("  TAXI BOSS (ROBLOX) – AUTO-SHIFTER FÜR macOS (TURBO-MODUS GANG 1 & 2)")
         print("=" * 76)
         print(f"  Bildschirm (Logisch):  {self.logical_width} x {self.logical_height} Punkte (pynput)")
         print(f"  Bildschirm (Retina):   {phys_w} x {phys_h} Pixel (Skalierung {self.retina_scale:.1f}x)")
@@ -456,24 +476,10 @@ class AutoShifter:
             f"  Grün-Schwellenwert:    G > {GREEN_MIN_VALUE}, "
             f"G > R * {GREEN_DOMINANCE_RATIO}, G > B * {GREEN_DOMINANCE_RATIO}"
         )
-        print(f"  Schalt-Cooldown:       {SHIFT_COOLDOWN:.2f} Sekunden")
-        print("-" * 76)
-        print("  macOS-Berechtigungsstatus (für PyCharm / Terminal):")
-        print(f"    1. Bildschirmaufnahme (mss):           {'OK' if screen_ok else 'FEHLT!'}")
-        print(f"    2. Eingabeüberwachung (Hotkeys i/o/p): {'OK' if listen_ok else 'FEHLT! (siehe Hinweis unten)'}")
-        print(f"    3. Bedienungshilfen (Taste e drücken): {'OK' if post_ok else 'FEHLT! (siehe Hinweis unten)'}")
-
-        if not (listen_ok and post_ok):
-            print("-" * 76)
-            print("  WICHTIG – WARUM [i] NOCH NICHT GLOBAL REAGIERT HAT:")
-            print("  macOS blockiert globale Tastendrücke, solange PyCharm (bzw. Terminal) nicht")
-            print("  in den Systemeinstellungen freigegeben ist:")
-            print("    -> Systemeinstellungen -> Datenschutz & Sicherheit -> Bedienungshilfen")
-            print("    -> Systemeinstellungen -> Datenschutz & Sicherheit -> Eingabeüberwachung")
-            print("  Schalte dort den Schalter für PyCharm / Terminal ein und starte das Skript neu.")
-            print("  (Tipp: Direkt hier in der Konsole kannst du 'i', 'o', 'p' [+ Enter in PyCharm]")
-            print("   auch jetzt schon zum Testen eingeben!)")
-
+        print(
+            f"  Dynamischer Cooldown:  {MIN_SHIFT_COOLDOWN*1000:.0f}–{MAX_SHIFT_COOLDOWN*1000:.0f} ms "
+            f"(sofort bereit, sobald Kreis wieder grau)"
+        )
         print("-" * 76)
         print("  Steuerung per Hotkeys:")
         print("    [i]   Mausposition als Schalt-Punkt speichern + RGB anzeigen")
@@ -487,7 +493,6 @@ class AutoShifter:
         screen_ok, listen_ok, post_ok = check_and_request_macos_permissions()
         self.print_banner(screen_ok, listen_ok, post_ok)
 
-        # Falls Berechtigungen fehlen, öffne optional direkt die passende macOS-Systemeinstellung
         if not (listen_ok and post_ok):
             try:
                 subprocess.run(
