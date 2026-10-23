@@ -1,0 +1,64 @@
+{
+  "points": {
+    "shift_point": {
+      "rel_x": 0.09883,
+      "rel_y": 0.439024,
+      "description": "Kleiner Kreis im Tacho für Up-Shift [E]",
+      "last_logical": [
+        169,
+        486
+      ]
+    },
+    "needle_target_point": {
+      "rel_x": 0.481871,
+      "rel_y": 0.766938,
+      "description": "Zielpunkt für weiße Tachonadel zwischen 4 und 5 (Blaue Zone)",
+      "last_logical": [
+        824,
+        849
+      ]
+    },
+    "traffic_light_point": {
+      "rel_x": 0.502339,
+      "rel_y": 0.158988,
+      "ref_rgb": [
+        73,
+        60,
+        67
+      ],
+      "description": "Punkt auf der dunklen Ampel-Box oben in der Mitte",
+      "last_logical": [
+        859,
+        176
+      ]
+    },
+    "continue_button_point": {
+      "rel_x": 0.09883,
+      "rel_y": 0.439024,
+      "description": "Punkt auf dem grünen WEITER-Button im End-Popup",
+      "last_logical": [
+        169,
+        486
+      ]
+    }
+  },
+  "thresholds": {
+    "shift_green_min": 95,
+    "shift_green_ratio": 1.22,
+    "continue_green_min": 115,
+    "continue_green_ratio_r": 1.3,
+    "continue_green_ratio_b": 1.6,
+    "needle_white_min": 195,
+    "needle_white_max_diff": 35,
+    "traffic_light_tolerance": 24
+  },
+  "timings": {
+    "key_hold_duration": 0.012,
+    "min_shift_cooldown": 0.085,
+    "max_shift_cooldown": 0.22,
+    "needle_pulse_hold": 0.022,
+    "needle_release_pause": 0.012,
+    "popup_click_interval": 0.55,
+    "scan_interval": 0.0
+  }
+}

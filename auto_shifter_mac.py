@@ -1,36 +1,43 @@
 #!/usr/bin/env python3
 """
-Taxi Boss (Roblox) – Performanter Auto-Shifter für macOS (Retina-kompatibel)
-============================================================================
+auto_shifter_mac.py – Vollautomatischer Taxi Boss (Roblox) Renn-Bot für macOS
+=============================================================================
 
-Vorab-Analyse des Referenzbilds ("Bildschirmfoto 2026-10-23 um 09.32.46.png"):
-------------------------------------------------------------------------------
-- Physische Screenshot-Auflösung (Retina 2x): 3420 x 2214 Pixel
-- Logische macOS-Bildschirmauflösung (Points): 1710 x 1107 Punkte (Skalierungsfaktor 2.0x)
+Nutzt die geteilten Kernfunktionen aus `core_utils.py` sowie `config.json` und
+stellt die macOS-spezifischen Treiber (Quartz CoreGraphics / Retina-Skalierung /
+pynput) bereit.
 
-Gefundene graue Kreise im Tacho (horizontal exakt mittig bei X = 50.00 %):
-1. Schalt-Indikator-Kreis (Shift-Light im Tacho, mittig über Gang "1"):
-   - Relativ:              X = 50.00 %, Y = 77.87 %
-   - Logische Koordinate:  (855, 862)   [macOS Points / pynput]
-   - Physische Koordinate: (1710, 1724) [Retina Pixel im Screenshot]
-   - Ruhefarbe (Grau):     RGB(50, 50, 50) / #323232
+Ablauf der 3 Phasen im Vollautomatik-Modus (`FULL_AUTO`):
+---------------------------------------------------------
+1. Phase 1 (`WAITING_AT_LIGHT` – Referenz: Bildschirmfoto 13.53.03):
+   - Erkennt die dunkle Ampel-Box oben in der Mitte (`Traffic_Light_Point`).
+   - Regelt die Taste `w` per schnellem PWM/Feathering so, dass die weiße
+     Tachonadel am `Needle_Target_Point` im blauen Bereich zwischen 4 und 5
+     gehalten wird (sobald weiße Pixel erkannt werden -> sofort `release('w')`).
+2. Phase 2 (`RACING` – Referenz: Bildschirmfoto 09.32.46):
+   - Sobald die Ampel-Box verschwindet (`GO!`), wird `w` durchgehend gehalten.
+   - Überwacht `Shift_Point` mit ~120 Hz und drückt sofort `e`, sobald der
+     Schalt-Kreis grün wird (inkl. dynamischem 85–220 ms Cooldown für Gang 1 & 2).
+3. Phase 3 (`POST_RACE_POPUP` – Referenz: Bildschirmfoto 13.58.00):
+   - Sobald der grüne `WEITER`-Button (`Continue_Button_Point`) erscheint, wird
+     `w` sofort losgelassen (`release('w')`).
+   - Klickt automatisch auf `WEITER` und wechselt zurück in Phase 1, sobald die
+     Ampel für das nächste Rennen erscheint.
 
-2. Tacho-Zentrum / Nadel-Kreis (direkt über "0 km/h"):
-   - Relativ:              X = 50.00 %, Y = 85.19 %
-   - Logische Koordinate:  (855, 943)   [macOS Points / pynput]
-   - Physische Koordinate: (1710, 1886) [Retina Pixel im Screenshot]
-   - Ruhefarbe (Hellgrau): RGB(200, 200, 200) / #C8C8C8
-
-Hotkeys:
---------
-- [i] Aktuelle Mausposition als Schalt-Punkt speichern + RGB-Wert im Terminal ausgeben
-      (WICHTIG: Der Kreis darf dabei noch GRAU sein! Es wird nur die Position gespeichert.)
-- [o] Auto-Shifter starten / pausieren
-- [p] Skript sauber beenden
+Hotkeys (macOS):
+----------------
+- [o]       Bot starten / pausieren (mit automatischem Safety-Release für W & E)
+- [p]       Skript sauber beenden (mit garantiertem Safety-Release für W & E)
+- [m]       Modus wechseln: Vollautomatik-Bot (`FULL_AUTO`) <-> Nur Auto-Shifter (`SHIFT_ONLY`)
+- [i] / [1] Kalibriere `Shift_Point` (kleiner Kreis im Tacho für E)
+- [2]       Kalibriere `Needle_Target_Point` (weiße Tachonadel zwischen 4 und 5)
+- [3]       Kalibriere `Traffic_Light_Point` (Ampel-Box oben in der Mitte)
+- [4]       Kalibriere `Continue_Button_Point` (grüner WEITER-Button im End-Popup)
 """
 
 from __future__ import annotations
 
+import atexit
 import os
 import select
 import subprocess
@@ -39,10 +46,21 @@ import termios
 import threading
 import time
 import tty
-from typing import Any, Tuple
+from typing import Dict, Tuple
 
-import mss
 from pynput import keyboard, mouse
+
+from core_utils import (
+    ConfigManager,
+    DragRaceStateMachine,
+    InputDriver,
+    ScreenCaptureManager,
+    create_mss_instance,
+    is_continue_button_green,
+    is_needle_white,
+    is_shift_green,
+    is_traffic_light_present,
+)
 
 try:
     from AppKit import NSScreen
@@ -61,45 +79,26 @@ except ImportError:
 
 
 # ============================================================================
-# KONFIGURATION & SCHWELLENWERTE (OPTIMIERT FÜR GANG 1 & 2)
+# macOS VIRTUAL KEYCODES
 # ============================================================================
 
-# Relative Standard-Position aus der Screenshot-Analyse (Schalt-Indikator-Kreis)
-DEFAULT_REL_X: float = 0.5000  # 1710 / 3420 (exakt mittig)
-DEFAULT_REL_Y: float = 0.7787  # 1724 / 2214 (Schalt-Kreis im Tacho)
+MACOS_VK_W: int = 13  # Taste 'w'
+MACOS_VK_E: int = 14  # Taste 'e'
 
-# Überwachungsbereich rund um die Zielkoordinate (3x3 Bereich)
-SAMPLE_BOX_SIZE: int = 3
-
-# Schwellenwert-Logik für Grün-Erkennung:
-# Etwas sensibler eingestellt (G > 95 statt 140), damit bereits der allererste
-# Übergangs-Frame von Grau RGB(50,50,50) zu Grün im 1. und 2. Gang sofort auslöst!
-GREEN_MIN_VALUE: int = 95
-GREEN_DOMINANCE_RATIO: float = 1.22  # G > R * 1.22 und G > B * 1.22
-
-# Timing-Parameter (Ultra-Low-Latency für schnelle erste Gänge):
-KEY_HOLD_DURATION: float = 0.012  # 12 ms Tastendruck (schnellstmögliche Registrierung in Roblox)
-MIN_SHIFT_COOLDOWN: float = 0.085 # 85 ms Mindest-Pause, damit der 2. Gang nicht verschlafen wird
-MAX_SHIFT_COOLDOWN: float = 0.22  # Max. Wartezeit, falls der Kreis länger grün bleibt
-SCAN_INTERVAL: float = 0.0        # 0.0 s Zusatzpause -> volle 120 Hz Synchronisation mit macOS WindowServer
-
-# macOS Virtual KeyCodes für i, o, p + e
-MACOS_VK_MAP: dict[int, str] = {
-    34: "i",  # Taste 'i'
-    31: "o",  # Taste 'o'
-    35: "p",  # Taste 'p'
+MACOS_VK_HOTKEYS: Dict[int, str] = {
+    34: "i",  # 'i' -> Shift_Point kalibrieren
+    31: "o",  # 'o' -> Start / Pause
+    35: "p",  # 'p' -> Beenden
+    46: "m",  # 'm' -> Modus wechseln (Full-Auto <-> Shift-Only)
+    18: "1",  # '1' -> Shift_Point kalibrieren
+    19: "2",  # '2' -> Needle_Target_Point kalibrieren
+    20: "3",  # '3' -> Traffic_Light_Point kalibrieren
+    21: "4",  # '4' -> Continue_Button_Point kalibrieren
 }
-MACOS_VK_E: int = 14  # Physischer Keycode für 'e' auf macOS
-
-
-def create_mss_instance() -> Any:
-    """Erstellt eine MSS-Instanz kompatibel mit mss 9.x und mss 10.x+ (ohne DeprecationWarning)."""
-    mss_cls = getattr(mss, "MSS", None) or getattr(mss, "mss")
-    return mss_cls()
 
 
 def detect_retina_scale() -> float:
-    """Ermittelt den physischen Retina-Skalierungsfaktor unter macOS (z. B. 2.0 auf Retina-Displays)."""
+    """Ermittelt den physischen Retina-Skalierungsfaktor unter macOS (z. B. 2.0x)."""
     if NSScreen is not None:
         try:
             main_screen = NSScreen.mainScreen()
@@ -110,13 +109,22 @@ def detect_retina_scale() -> float:
     return 2.0
 
 
+def detect_logical_screen_size() -> Tuple[int | None, int | None]:
+    """Liest die logische Quartz-Bildschirmauflösung (Points) unter macOS aus."""
+    if Quartz is not None:
+        try:
+            main_id = Quartz.CGMainDisplayID()
+            return (
+                int(Quartz.CGDisplayPixelsWide(main_id)),
+                int(Quartz.CGDisplayPixelsHigh(main_id)),
+            )
+        except Exception:
+            pass
+    return None, None
+
+
 def check_and_request_macos_permissions() -> Tuple[bool, bool, bool]:
-    """
-    Prüft die macOS-Berechtigungen für:
-      1. Bildschirmaufnahme (Screen Recording) -> für mss
-      2. Eingabeüberwachung (Input Monitoring) -> für globale Hotkeys (i, o, p)
-      3. Bedienungshilfen (Accessibility)      -> für automatisches Drücken von 'e'
-    """
+    """Prüft Bildschirmaufnahme-, Eingabeüberwachungs- und Bedienungshilfen-Rechte unter macOS."""
     screen_ok = True
     listen_ok = True
     post_ok = True
@@ -151,270 +159,250 @@ def check_and_request_macos_permissions() -> Tuple[bool, bool, bool]:
     return screen_ok, listen_ok, post_ok
 
 
-class AutoShifter:
-    """Performanter macOS Auto-Shifter für Taxi Boss (Roblox)."""
+# ============================================================================
+# macOS INPUT-TREIBER MIT SAFETY-RELEASE
+# ============================================================================
+
+class MacInputDriver(InputDriver):
+    """
+    Nativ-performanter macOS-Treiber für Tastatur (`w`, `e`) und Maus-Klicks.
+    Nutzt Quartz CoreGraphics CGEvents (mit `pynput` als Fallback) und garantiert
+    über `release_all()`, dass niemals eine Taste hängen bleibt.
+    """
 
     def __init__(self) -> None:
-        self.mouse_ctrl = mouse.Controller()
         self.kb_ctrl = keyboard.Controller()
-
+        self.mouse_ctrl = mouse.Controller()
         self._lock = threading.Lock()
-        self.active: bool = False
-        self.running: bool = True
-        self.shift_count: int = 0
-        self._last_cmd_time: dict[str, float] = {"i": 0.0, "o": 0.0, "p": 0.0}
+        self._w_pressed: bool = False
+        self._last_w_refresh: float = 0.0
 
-        self.retina_scale: float = detect_retina_scale()
+        # Safety-Hook beim Beenden des Python-Prozesses registrieren
+        atexit.register(self.release_all)
 
-        # Bildschirm- und Koordinatenskalierung zwischen pynput (Logisch) und mss prüfen
-        with create_mss_instance() as sct:
-            primary_mon = sct.monitors[1]
-            self.mss_left: int = int(primary_mon["left"])
-            self.mss_top: int = int(primary_mon["top"])
-            self.mss_width: int = int(primary_mon["width"])
-            self.mss_height: int = int(primary_mon["height"])
-
-        # Logische Quartz-Auflösung bestimmen (Koordinatensystem von pynput)
+    def _post_key(self, vk: int, char: str, is_down: bool) -> None:
+        """Sendet ein einzelnes Tastatur-Event über Quartz (oder pynput als Fallback)."""
         if Quartz is not None:
-            main_id = Quartz.CGMainDisplayID()
-            self.logical_width: int = int(Quartz.CGDisplayPixelsWide(main_id))
-            self.logical_height: int = int(Quartz.CGDisplayPixelsHigh(main_id))
+            try:
+                evt = Quartz.CGEventCreateKeyboardEvent(None, vk, is_down)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, evt)
+                return
+            except Exception:
+                pass
+        if is_down:
+            self.kb_ctrl.press(char)
         else:
-            self.logical_width = self.mss_width
-            self.logical_height = self.mss_height
+            self.kb_ctrl.release(char)
 
-        # Faktor zwischen logischen pynput-Punkten und mss-Koordinaten
-        self.mss_coord_scale_x: float = (
-            self.mss_width / self.logical_width if self.logical_width else 1.0
-        )
-        self.mss_coord_scale_y: float = (
-            self.mss_height / self.logical_height if self.logical_height else 1.0
-        )
-
-        # Vorausgewählte logische Koordinate anhand der Vorab-Analyse setzen
-        self.target_logical_x: int = int(round(self.logical_width * DEFAULT_REL_X))
-        self.target_logical_y: int = int(round(self.logical_height * DEFAULT_REL_Y))
-        self._cached_bbox: dict[str, int] = self._build_capture_bbox(
-            self.target_logical_x, self.target_logical_y
-        )
-
-    @staticmethod
-    def is_green(r: int, g: int, b: int) -> bool:
-        """
-        Prüft anhand der Schwellenwert-Logik, ob ein RGB-Wert als 'Grün'
-        (optimaler Schaltzeitpunkt) gilt:
-        G > 95 sowie G > R * 1.22 und G > B * 1.22
-        """
-        return (
-            g > GREEN_MIN_VALUE
-            and g > (r * GREEN_DOMINANCE_RATIO)
-            and g > (b * GREEN_DOMINANCE_RATIO)
-        )
-
-    def _build_capture_bbox(self, logical_x: int, logical_y: int) -> dict[str, int]:
-        """
-        Rechnet die logische Mauskoordinate (pynput) exakt in das mss-Koordinatensystem um
-        und erstellt eine 3x3-Bounding-Box rund um den Zielpunkt.
-        """
-        mss_x = int(round(logical_x * self.mss_coord_scale_x))
-        mss_y = int(round(logical_y * self.mss_coord_scale_y))
-        half = SAMPLE_BOX_SIZE // 2
-        return {
-            "left": mss_x - half,
-            "top": mss_y - half,
-            "width": SAMPLE_BOX_SIZE,
-            "height": SAMPLE_BOX_SIZE,
-        }
-
-    def sample_region_fast(self, sct: Any, bbox: dict[str, int]) -> Tuple[Tuple[int, int, int], bool]:
-        """
-        Ultraschnelle Auswertung des 3x3-Bereichs direkt auf dem BGRA-Speicherpuffer.
-        """
-        sct_img = sct.grab(bbox)
-        raw: bytes = sct_img.raw
-
-        # Schnelle Prüfung über alle Pixel im 3x3-Überwachungsbereich
-        for offset in range(0, len(raw), 4):
-            g = raw[offset + 1]
-            if g > GREEN_MIN_VALUE:
-                b = raw[offset]
-                r = raw[offset + 2]
-                if g > (r * GREEN_DOMINANCE_RATIO) and g > (b * GREEN_DOMINANCE_RATIO):
-                    return (r, g, b), True
-
-        # Falls nicht grün: Zentrumspixel für Diagnose/Kalibrierung zurückgeben
-        width: int = sct_img.width
-        height: int = sct_img.height
-        center_offset = ((height // 2) * width + (width // 2)) * 4
-        return (raw[center_offset + 2], raw[center_offset + 1], raw[center_offset]), False
-
-    def sample_region(
-        self, sct: Any, logical_x: int, logical_y: int
-    ) -> Tuple[Tuple[int, int, int], bool]:
-        """Komfort-Wrapper für Kalibrierung und Diagnose."""
-        bbox = self._build_capture_bbox(logical_x, logical_y)
-        return self.sample_region_fast(sct, bbox)
-
-    def trigger_shift(self) -> None:
-        """
-        Sendet den Tastendruck 'e' mit minimaler Latenz direkt über Quartz CGEvents
-        (bzw. pynput als Fallback), damit keine Millisekunde im 1./2. Gang verloren geht.
-        """
-        if Quartz is not None:
-            down_evt = Quartz.CGEventCreateKeyboardEvent(None, MACOS_VK_E, True)
-            up_evt = Quartz.CGEventCreateKeyboardEvent(None, MACOS_VK_E, False)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down_evt)
-            time.sleep(KEY_HOLD_DURATION)
-            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up_evt)
-        else:
-            self.kb_ctrl.press("e")
-            time.sleep(KEY_HOLD_DURATION)
-            self.kb_ctrl.release("e")
-
-    def calibrate_at_mouse(self) -> None:
-        """
-        [i] Speichert die aktuelle Mausposition als Schalt-Punkt und gibt sowohl
-        logische als auch physische Retina-Koordinaten sowie den gelesenen RGB-Wert aus.
-        """
-        mx, my = self.mouse_ctrl.position
-        logical_x = int(round(mx))
-        logical_y = int(round(my))
-        new_bbox = self._build_capture_bbox(logical_x, logical_y)
-
+    def press_w(self) -> None:
+        """Drückt und hält 'w'. Erneuert das KeyDown-Signal periodisch für Roblox."""
+        now = time.monotonic()
         with self._lock:
-            self.target_logical_x = logical_x
-            self.target_logical_y = logical_y
-            self._cached_bbox = new_bbox
+            if not self._w_pressed or (now - self._last_w_refresh) >= 0.18:
+                self._post_key(MACOS_VK_W, "w", True)
+                self._w_pressed = True
+                self._last_w_refresh = now
 
+    def release_w(self) -> None:
+        """Lässt 'w' sofort los."""
+        with self._lock:
+            if self._w_pressed:
+                self._post_key(MACOS_VK_W, "w", False)
+                self._w_pressed = False
+
+    def tap_e(self, hold_duration: float = 0.012) -> None:
+        """Drückt 'e' kurz (Up-Shift) und lässt es sofort wieder los."""
+        self._post_key(MACOS_VK_E, "e", True)
+        time.sleep(hold_duration)
+        self._post_key(MACOS_VK_E, "e", False)
+        # Falls W gehalten wird, KeyDown für W direkt auffrischen, damit Roblox Vollgas beibehält
+        with self._lock:
+            if self._w_pressed:
+                self._post_key(MACOS_VK_W, "w", True)
+                self._last_w_refresh = time.monotonic()
+
+    def click_at(self, logical_x: int, logical_y: int) -> None:
+        """
+        Bewegt den Mauszeiger zum Zielpunkt (inkl. minimalem Hover-Impuls für Roblox UI)
+        und führt einen zuverlässigen Linksklick aus.
+        """
+        if Quartz is not None:
+            try:
+                pt_hover = Quartz.CGPoint(float(logical_x + 1), float(logical_y))
+                pt = Quartz.CGPoint(float(logical_x), float(logical_y))
+
+                move1 = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved, pt_hover, Quartz.kCGMouseButtonLeft
+                )
+                move2 = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved, pt, Quartz.kCGMouseButtonLeft
+                )
+                down = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventLeftMouseDown, pt, Quartz.kCGMouseButtonLeft
+                )
+                up = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventLeftMouseUp, pt, Quartz.kCGMouseButtonLeft
+                )
+
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, move1)
+                time.sleep(0.010)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, move2)
+                time.sleep(0.015)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+                time.sleep(0.025)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+                return
+            except Exception:
+                pass
+
+        self.mouse_ctrl.position = (logical_x, logical_y)
+        time.sleep(0.015)
+        self.mouse_ctrl.press(mouse.Button.left)
+        time.sleep(0.025)
+        self.mouse_ctrl.release(mouse.Button.left)
+
+    def release_all(self) -> None:
+        """
+        Safety-Release: Lässt garantiert 'w' und 'e' sowohl über Quartz als auch über
+        pynput los, damit auf macOS niemals eine Taste hängen bleibt.
+        """
+        with self._lock:
+            self._w_pressed = False
+        try:
+            self._post_key(MACOS_VK_W, "w", False)
+            self._post_key(MACOS_VK_E, "e", False)
+        except Exception:
+            pass
+        try:
+            self.kb_ctrl.release("w")
+            self.kb_ctrl.release("e")
+        except Exception:
+            pass
+
+
+# ============================================================================
+# macOS HAUPTSTEUERUNG & KALIBRIERUNG
+# ============================================================================
+
+class MacDragBotApp:
+    """Verbindet `DragRaceStateMachine`, `ConfigManager` und macOS-Hotkeys."""
+
+    CALIBRATION_MAP: Dict[str, Tuple[str, str]] = {
+        "1": ("shift_point", "Shift_Point (Kleiner Kreis im Tacho für E)"),
+        "i": ("shift_point", "Shift_Point (Kleiner Kreis im Tacho für E)"),
+        "2": ("needle_target_point", "Needle_Target_Point (Weiße Tachonadel zwischen 4 und 5)"),
+        "3": ("traffic_light_point", "Traffic_Light_Point (Ampel-Box oben in der Mitte)"),
+        "4": ("continue_button_point", "Continue_Button_Point (Grüner WEITER-Button im Popup)"),
+    }
+
+    def __init__(self) -> None:
+        self.config = ConfigManager()
+        retina_scale = detect_retina_scale()
+        log_w, log_h = detect_logical_screen_size()
+
+        self.capture = ScreenCaptureManager(
+            logical_width=log_w,
+            logical_height=log_h,
+            retina_scale=retina_scale,
+        )
+        self.driver = MacInputDriver()
+        self.bot = DragRaceStateMachine(
+            config=self.config,
+            capture=self.capture,
+            driver=self.driver,
+        )
+        self.mouse_ctrl = mouse.Controller()
+        self._cmd_lock = threading.Lock()
+        self._last_cmd_time: Dict[str, float] = {}
+
+    def calibrate_point(self, key_cmd: str) -> None:
+        """
+        Speichert die aktuelle Mausposition für den gewählten Punkt in `config.json`
+        und gibt logische/physische Koordinaten sowie den gelesenen RGB-Wert aus.
+        """
+        if key_cmd not in self.CALIBRATION_MAP:
+            return
+
+        point_name, label = self.CALIBRATION_MAP[key_cmd]
+        mx, my = self.mouse_ctrl.position
+        lx, ly = int(round(mx)), int(round(my))
+        px, py = self.capture.to_physical_coords(lx, ly)
+
+        bbox = self.capture.build_bbox(lx, ly, box_size=3)
         with create_mss_instance() as sct:
-            rgb, detected_green = self.sample_region_fast(sct, new_bbox)
+            rgb, _ = self.capture.sample_bbox_fast(sct, bbox)
 
-        phys_x = int(round(logical_x * self.retina_scale))
-        phys_y = int(round(logical_y * self.retina_scale))
         r, g, b = rgb
         hex_color = f"#{r:02X}{g:02X}{b:02X}"
-        green_status = (
-            "GRÜN ERKANNT (Schaltpunkt!)"
-            if detected_green
-            else "Grau / Nicht grün (Position gespeichert – bereit für Grün!)"
+
+        # Für die Ampel speichern wir zusätzlich den aktuellen RGB-Wert als Referenz
+        ref_rgb = rgb if point_name == "traffic_light_point" else None
+        self.config.update_point_from_logical(
+            point_name=point_name,
+            logical_x=lx,
+            logical_y=ly,
+            logical_width=self.capture.logical_width,
+            logical_height=self.capture.logical_height,
+            ref_rgb=ref_rgb,
         )
+        self.bot.refresh_bboxes()
+
+        # Passende Farbdiagnose ausgeben
+        if point_name == "shift_point":
+            status = "GRÜN (Schaltpunkt!)" if is_shift_green(r, g, b) else "Grau/Ruhezustand (Bereit für Grün)"
+        elif point_name == "needle_target_point":
+            status = "WEISS (Nadel erkannt!)" if is_needle_white(r, g, b) else "Dunkel (Bereit für weiße Nadel)"
+        elif point_name == "traffic_light_point":
+            status = (
+                "Ampel-Box erkannt (Referenz gespeichert)"
+                if is_traffic_light_present(r, g, b, rgb)
+                else "Referenzfarbe für Ampel gespeichert"
+            )
+        else:
+            status = (
+                "WEITER-Grün erkannt!"
+                if is_continue_button_green(r, g, b)
+                else "Position gespeichert (Bereit für grünen WEITER-Button)"
+            )
 
         print(
-            f"\n[KALIBRIERUNG - i] Aktuelle Mausposition als Schalt-Punkt gespeichert:\n"
-            f"  -> Logische Koordinate (Points):       ({logical_x}, {logical_y})\n"
-            f"  -> Physische Retina-Pixel ({self.retina_scale:.1f}x):      ({phys_x}, {phys_y})\n"
-            f"  -> Gelesener RGB-Wert (3x3-Zentrum):   RGB({r}, {g}, {b}) | {hex_color} | {green_status}",
+            f"\n[KALIBRIERUNG - Taste '{key_cmd}'] {label} gespeichert in config.json:\n"
+            f"  -> Logisch (Points):                   ({lx}, {ly})\n"
+            f"  -> Physisch Retina ({self.capture.retina_scale:.1f}x):             ({px}, {py})\n"
+            f"  -> Gelesener RGB-Wert (3x3-Zentrum):   RGB({r}, {g}, {b}) | {hex_color} | {status}",
             flush=True,
         )
 
-    def toggle_active(self) -> None:
-        """[o] Startet oder pausiert den Auto-Shifter."""
-        with self._lock:
-            self.active = not self.active
-            state = self.active
-            tx, ty = self.target_logical_x, self.target_logical_y
-
-        phys_tx = int(round(tx * self.retina_scale))
-        phys_ty = int(round(ty * self.retina_scale))
-
-        if state:
-            print(
-                f"\n[STATUS - o] Auto-Shifter AKTIVIERT – "
-                f"Überwache Logisch ({tx}, {ty}) / Retina ({phys_tx}, {phys_ty}) mit 120 Hz ...",
-                flush=True,
-            )
-        else:
-            print("\n[STATUS - o] Auto-Shifter PAUSIERT.", flush=True)
-
-    def stop(self) -> None:
-        """[p] Beendet das Skript sauber."""
-        with self._lock:
-            if not self.running:
-                return
-            self.running = False
-            self.active = False
-        print("\n[BEENDEN - p] Auto-Shifter wird sauber beendet ...", flush=True)
-
     def handle_command(self, cmd: str) -> bool:
-        """
-        Verarbeitet einen Hotkey-Befehl ('i', 'o', 'p') mit kurzer Entprellung (150 ms).
-        """
+        """Verarbeitet Hotkey-Befehle mit 180 ms Entprellung. Gibt True bei Beenden ('p') zurück."""
         now = time.monotonic()
-        with self._lock:
-            if now - self._last_cmd_time.get(cmd, 0.0) < 0.15:
-                return not self.running
+        with self._cmd_lock:
+            if now - self._last_cmd_time.get(cmd, 0.0) < 0.18:
+                return not self.bot.running
             self._last_cmd_time[cmd] = now
 
-        if cmd == "i":
-            self.calibrate_at_mouse()
+        if cmd in self.CALIBRATION_MAP:
+            self.calibrate_point(cmd)
         elif cmd == "o":
-            self.toggle_active()
+            self.bot.toggle_active()
+        elif cmd == "m":
+            self.bot.toggle_mode()
         elif cmd == "p":
-            self.stop()
+            print("\n[BEENDEN - p] Bot wird sauber beendet (Safety-Release für W & E) ...", flush=True)
+            self.bot.stop()
             return True
         return False
 
-    def monitor_loop(self) -> None:
-        """
-        Hochgeschwindigkeits-Hauptschleife (~120 Hz, ohne künstliches Sleep-Delay):
-        1. Sobald Grün erkannt wird, wird SOFORT (vor jeder Terminal-Ausgabe) 'e' gedrückt.
-        2. Danach greift eine intelligente Entprellung: Nach nur 85 ms Mindestpause
-           wird sofort geprüft, wann der Kreis wieder grau wird (statt starr 250 ms
-           zu schlafen). Dadurch werden auch extrem schnelle Gangwechsel vom 1. in den
-           2. und 3. Gang rechtzeitig erwischt.
-        """
-        with create_mss_instance() as sct:
-            while self.running:
-                if not self.active:
-                    time.sleep(0.025)
-                    continue
-
-                bbox = self._cached_bbox
-                rgb, is_shift_ready = self.sample_region_fast(sct, bbox)
-
-                if is_shift_ready:
-                    # 1. SOFORT schalten – keine Zeit durch print() vor dem Tastendruck verlieren!
-                    shift_start = time.perf_counter()
-                    self.trigger_shift()
-                    self.shift_count += 1
-
-                    # 2. Terminal-Ausgabe während ohnehin die Mindest-Entprellung läuft
-                    r, g, b = rgb
-                    tx, ty = self.target_logical_x, self.target_logical_y
-                    timestamp = time.strftime("%H:%M:%S")
-                    print(
-                        f"[{timestamp}] SCHALTEN #{self.shift_count:02d} -> Taste 'e' gedrückt! "
-                        f"(RGB({r}, {g}, {b}) bei ({tx}, {ty}))",
-                        flush=True,
-                    )
-
-                    # 3. Kurze Mindest-Entprellung (85 ms ab Schaltbeginn), damit Roblox den Gang wechselt
-                    elapsed = time.perf_counter() - shift_start
-                    if elapsed < MIN_SHIFT_COOLDOWN:
-                        time.sleep(MIN_SHIFT_COOLDOWN - elapsed)
-
-                    # 4. Dynamisches Warten bis der Kreis nach dem Schalten wieder grau ist
-                    #    (maximal bis MAX_SHIFT_COOLDOWN = 220 ms Gesamtdauer).
-                    #    Sobald er grau ist, ist das Skript SOFORT bereit für den nächsten Gang!
-                    while self.running and self.active:
-                        if (time.perf_counter() - shift_start) >= MAX_SHIFT_COOLDOWN:
-                            break
-                        _, still_green = self.sample_region_fast(sct, self._cached_bbox)
-                        if not still_green:
-                            break
-                elif SCAN_INTERVAL > 0.0:
-                    time.sleep(SCAN_INTERVAL)
-
     def stdin_fallback_loop(self) -> None:
-        """
-        Fallback-Tastatur-Listener direkt im Terminal / in der PyCharm-Konsole.
-        """
+        """Erlaubt die Steuerung auch direkt durch Tastendruck im Terminal / in PyCharm."""
         if not sys.stdin or sys.stdin.closed:
             return
 
         fd = None
         old_settings = None
         is_tty = False
+        valid_cmds = ("o", "p", "m", "i", "1", "2", "3", "4")
+
         try:
             fd = sys.stdin.fileno()
             is_tty = os.isatty(fd)
@@ -425,12 +413,12 @@ class AutoShifter:
             is_tty = False
 
         try:
-            while self.running:
+            while self.bot.running:
                 if is_tty and fd is not None:
                     rlist, _, _ = select.select([fd], [], [], 0.1)
                     if rlist:
                         ch = os.read(fd, 1).decode("utf-8", errors="ignore").lower()
-                        if ch in ("i", "o", "p"):
+                        if ch in valid_cmds:
                             if self.handle_command(ch):
                                 break
                 else:
@@ -440,7 +428,7 @@ class AutoShifter:
                         if not line:
                             break
                         cmd = line.strip().lower()
-                        if cmd in ("i", "o", "p"):
+                        if cmd in valid_cmds:
                             if self.handle_command(cmd):
                                 break
         except Exception:
@@ -453,43 +441,47 @@ class AutoShifter:
                     pass
 
     def print_banner(self, screen_ok: bool, listen_ok: bool, post_ok: bool) -> None:
-        """Gibt beim Start alle System-, Berechtigungs- und Hotkey-Informationen im Terminal aus."""
-        phys_w = int(round(self.logical_width * self.retina_scale))
-        phys_h = int(round(self.logical_height * self.retina_scale))
-        phys_tx = int(round(self.target_logical_x * self.retina_scale))
-        phys_ty = int(round(self.target_logical_y * self.retina_scale))
+        """Gibt alle System-, Punkt- und Hotkey-Informationen übersichtlich im Terminal aus."""
+        lw, lh = self.capture.logical_width, self.capture.logical_height
+        pw, ph = self.capture.to_physical_coords(lw, lh)
 
-        with create_mss_instance() as sct:
-            init_rgb, _ = self.sample_region(sct, self.target_logical_x, self.target_logical_y)
+        s_pt = self.bot.shift_pt
+        n_pt = self.bot.needle_pt
+        l_pt = self.bot.light_pt
+        c_pt = self.bot.continue_pt
 
-        print("=" * 76)
-        print("  TAXI BOSS (ROBLOX) – AUTO-SHIFTER FÜR macOS (TURBO-MODUS GANG 1 & 2)")
-        print("=" * 76)
-        print(f"  Bildschirm (Logisch):  {self.logical_width} x {self.logical_height} Punkte (pynput)")
-        print(f"  Bildschirm (Retina):   {phys_w} x {phys_h} Pixel (Skalierung {self.retina_scale:.1f}x)")
-        print(
-            f"  Vorab-Schaltpunkt:     Logisch ({self.target_logical_x}, {self.target_logical_y}) | "
-            f"Retina ({phys_tx}, {phys_ty})"
-        )
-        print(f"  Aktuelles RGB dort:    RGB{init_rgb} (3x3-Überwachungsbereich)")
-        print(
-            f"  Grün-Schwellenwert:    G > {GREEN_MIN_VALUE}, "
-            f"G > R * {GREEN_DOMINANCE_RATIO}, G > B * {GREEN_DOMINANCE_RATIO}"
-        )
-        print(
-            f"  Dynamischer Cooldown:  {MIN_SHIFT_COOLDOWN*1000:.0f}–{MAX_SHIFT_COOLDOWN*1000:.0f} ms "
-            f"(sofort bereit, sobald Kreis wieder grau)"
-        )
-        print("-" * 76)
+        print("=" * 80)
+        print("  TAXI BOSS (ROBLOX) – VOLLAUTOMATISCHER RENN-BOT FÜR macOS")
+        print("=" * 80)
+        print(f"  Bildschirm (Logisch):     {lw} x {lh} Punkte (pynput)")
+        print(f"  Bildschirm (Retina):      {pw} x {ph} Pixel (Skalierung {self.capture.retina_scale:.1f}x)")
+        print(f"  Konfigurationsdatei:      {self.config.config_path}")
+        print(f"  Aktiver Modus:            {self.bot.mode.value} (Vollautomatik: Ampel -> Rennen -> Popup)")
+        print("-" * 80)
+        print("  Aktuelle Koordinaten (Logisch | Retina):")
+        print(f"    [1 / i] Shift_Point (Kreis für E):         {s_pt} | {self.capture.to_physical_coords(*s_pt)}")
+        print(f"    [2]     Needle_Target_Point (Nadel 4–5):   {n_pt} | {self.capture.to_physical_coords(*n_pt)}")
+        print(f"    [3]     Traffic_Light_Point (Ampel oben):  {l_pt} | {self.capture.to_physical_coords(*l_pt)}")
+        print(f"    [4]     Continue_Button_Point (WEITER):    {c_pt} | {self.capture.to_physical_coords(*c_pt)}")
+        print("-" * 80)
+        print("  macOS-Berechtigungsstatus:")
+        print(f"    - Bildschirmaufnahme (mss):           {'OK' if screen_ok else 'FEHLT!'}")
+        print(f"    - Eingabeüberwachung (Hotkeys):       {'OK' if listen_ok else 'FEHLT!'}")
+        print(f"    - Bedienungshilfen (Tasten/Maus):     {'OK' if post_ok else 'FEHLT!'}")
+        print("-" * 80)
         print("  Steuerung per Hotkeys:")
-        print("    [i]   Mausposition als Schalt-Punkt speichern + RGB anzeigen")
-        print("          (Der Kreis darf beim Drücken von [i] GRAU sein – es wird nur der Ort gespeichert!)")
-        print("    [o]   Auto-Shifter starten / pausieren")
-        print("    [p]   Skript sauber beenden")
-        print("=" * 76, flush=True)
+        print("    [o]       Bot STARTEN / PAUSIEREN (inkl. Safety-Release für W & E)")
+        print("    [p]       Skript SAUBER BEENDEN   (inkl. Safety-Release für W & E)")
+        print("    [m]       Modus wechseln: FULL_AUTO (Renn-Bot) <-> SHIFT_ONLY (Nur Schalten)")
+        print("    [1] / [i] Mausposition als Shift_Point speichern")
+        print("    [2]       Mausposition als Needle_Target_Point (zwischen 4 & 5) speichern")
+        print("    [3]       Mausposition als Traffic_Light_Point (Ampel oben) speichern")
+        print("    [4]       Mausposition als Continue_Button_Point (WEITER-Button) speichern")
+        print("=" * 80)
+        print("  Bereit! Drücke [o], um den vollautomatischen Renn-Bot zu starten.\n", flush=True)
 
     def run(self) -> None:
-        """Startet den Überwachungs-Thread, den Konsole-Fallback und den globalen Hotkey-Listener."""
+        """Startet State-Machine-Thread, Terminal-Fallback und globalen Hotkey-Listener."""
         screen_ok, listen_ok, post_ok = check_and_request_macos_permissions()
         self.print_banner(screen_ok, listen_ok, post_ok)
 
@@ -505,7 +497,7 @@ class AutoShifter:
             except Exception:
                 pass
 
-        worker = threading.Thread(target=self.monitor_loop, name="ShiftMonitorThread", daemon=True)
+        worker = threading.Thread(target=self.bot.run_loop, name="DragBotStateMachine", daemon=True)
         worker.start()
 
         stdin_worker = threading.Thread(
@@ -513,36 +505,45 @@ class AutoShifter:
         )
         stdin_worker.start()
 
+        valid_chars = {"o", "p", "m", "i", "1", "2", "3", "4"}
+
         def on_press(key: keyboard.Key | keyboard.KeyCode | None) -> bool | None:
             try:
                 cmd: str | None = None
                 char = getattr(key, "char", None)
-                if isinstance(char, str) and char.lower() in ("i", "o", "p"):
+                if isinstance(char, str) and char.lower() in valid_chars:
                     cmd = char.lower()
                 else:
                     vk = getattr(key, "vk", None)
-                    if isinstance(vk, int) and vk in MACOS_VK_MAP:
-                        cmd = MACOS_VK_MAP[vk]
+                    if isinstance(vk, int) and vk in MACOS_VK_HOTKEYS:
+                        cmd = MACOS_VK_HOTKEYS[vk]
 
                 if cmd is not None:
+                    # Kalibrierungstasten 1-4 während aktiver Fahrt ignorieren, falls versehentlich gedrückt,
+                    # außer der Bot ist pausiert oder 'i' wird gedrückt.
+                    if cmd in ("1", "2", "3", "4") and self.bot.active:
+                        return None
                     if self.handle_command(cmd):
-                        return False  # Beendet den pynput-Listener
+                        return False
             except Exception as exc:
                 print(f"[FEHLER] Hotkey-Verarbeitung: {exc}", file=sys.stderr, flush=True)
             return None
 
         try:
             with keyboard.Listener(on_press=on_press) as listener:
-                while self.running and listener.is_alive():
+                while self.bot.running and listener.is_alive():
                     time.sleep(0.1)
                 listener.stop()
         except KeyboardInterrupt:
-            self.stop()
+            self.bot.stop()
+        finally:
+            self.driver.release_all()
 
         worker.join(timeout=1.0)
-        print("Skript sauber beendet.", flush=True)
+        self.driver.release_all()
+        print("Skript sauber beendet (alle Tasten freigegeben).", flush=True)
 
 
 if __name__ == "__main__":
-    shifter = AutoShifter()
-    shifter.run()
+    app = MacDragBotApp()
+    app.run()
