@@ -1,0 +1,188 @@
+{
+  "modules": {
+    "auto_shift": true,
+    "auto_start": true,
+    "auto_skip": true
+  },
+  "timing": {
+    "tap_duration": 0.055,
+    "tap_cooldown": 0.001,
+    "shift_cooldown": 0.02,
+    "menu_click_delay": 0.5,
+    "loop_interval": 0.001,
+    "go_confirm_frames": 2,
+    "shift_tap_duration": 0.02,
+    "button_reclick_cooldown": 0.5
+  },
+  "needle": {
+    "start_angle_deg": 240.0,
+    "end_angle_deg": -80.0,
+    "radius_rel": 0.04386,
+    "white_min": 200,
+    "white_max_spread": 40,
+    "target_offset_deg": 0.0,
+    "radius_factors": [
+      0.85,
+      1.0,
+      1.15
+    ],
+    "zone_detect": true,
+    "zone_radius_rel": 0.08772,
+    "zone_target_fraction": 0.5,
+    "zone_refresh_s": 0.2
+  },
+  "points": {
+    "light_box_1": {
+      "x": 0.48246,
+      "y": 0.20777,
+      "rgb": [
+        54,
+        55,
+        59
+      ],
+      "tol": 32
+    },
+    "light_box_2": {
+      "x": 0.52632,
+      "y": 0.20777,
+      "rgb": [
+        54,
+        55,
+        59
+      ],
+      "tol": 32
+    },
+    "light_lamp": {
+      "x": 0.45906,
+      "y": 0.16938,
+      "rgb": [
+        197,
+        66,
+        61
+      ],
+      "tol": 45
+    },
+    "tacho_center": {
+      "x": 0.49985,
+      "y": 0.85185,
+      "rgb": [
+        200,
+        200,
+        200
+      ],
+      "tol": 40
+    },
+    "needle_target": {
+      "x": 0.48614,
+      "y": 0.71802,
+      "rgb": [
+        146,
+        221,
+        238
+      ],
+      "tol": 40
+    },
+    "shift_circle": {
+      "x": 0.5,
+      "y": 0.77913,
+      "rgb": [
+        50,
+        50,
+        50
+      ],
+      "tol": 50
+    },
+    "btn_weiter": {
+      "x": 0.46667,
+      "y": 0.76016,
+      "rgb": [
+        82,
+        146,
+        50
+      ],
+      "tol": 45
+    },
+    "btn_next_stage": {
+      "x": 0.71053,
+      "y": 0.92954,
+      "rgb": [
+        82,
+        146,
+        50
+      ],
+      "tol": 45
+    },
+    "btn_rennen": {
+      "x": 0.50292,
+      "y": 0.8374,
+      "rgb": [
+        82,
+        146,
+        50
+      ],
+      "tol": 45
+    },
+    "Give_Up_Button": {
+      "x": 0.35088,
+      "y": 0.63415,
+      "rgb": [
+        213,
+        87,
+        78
+      ],
+      "tol": 45
+    }
+  },
+  "colors": {
+    "light_box_normal": [
+      54,
+      55,
+      59
+    ],
+    "light_box_boss": [
+      142,
+      57,
+      60
+    ],
+    "light_lamp_red": [
+      197,
+      66,
+      61
+    ],
+    "needle_white": [
+      255,
+      255,
+      255
+    ],
+    "shift_green": [
+      80,
+      200,
+      80
+    ],
+    "button_green": [
+      82,
+      146,
+      50
+    ],
+    "give_up_red": [
+      213,
+      87,
+      78
+    ],
+    "cashout_orange": [
+      245,
+      189,
+      89
+    ],
+    "zone_blue": [
+      146,
+      220,
+      235
+    ]
+  },
+  "hotkeys": {
+    "calibrate": "f8",
+    "toggle": "f9",
+    "emergency": "f10"
+  }
+}

@@ -1,0 +1,14 @@
+# Taxi-Boss-Drag-Script-V2 – Abhängigkeiten
+# Installation: python3 -m pip install -r requirements.txt
+# (tkinter ist Teil der Python-Standardbibliothek)
+
+# Bildschirm-Capture (beide Plattformen)
+mss>=9.0.1
+
+# macOS: Tastatur/Maus + Hotkeys, Quartz-Events
+pynput>=1.7.6; sys_platform == "darwin"
+pyobjc-framework-Quartz>=9.0; sys_platform == "darwin"
+
+# Windows: DirectInput-Tastendrücke (Roblox) + globale Hotkeys
+pydirectinput>=1.0.4; sys_platform == "win32"
+keyboard>=0.13.5; sys_platform == "win32"
