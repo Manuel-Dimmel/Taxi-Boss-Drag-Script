@@ -5,31 +5,43 @@
     "auto_skip": true
   },
   "timing": {
-    "tap_duration": 0.055,
-    "tap_cooldown": 0.001,
+    "tap_duration": 0.014,
+    "tap_cooldown": 0.025,
+    "fine_tap_duration": 0.014,
+    "fine_tap_cooldown": 0.025,
+    "boost_tap_duration": 0.035,
+    "boost_tap_cooldown": 0.012,
     "shift_cooldown": 0.02,
     "menu_click_delay": 0.5,
     "loop_interval": 0.001,
     "go_confirm_frames": 2,
     "shift_tap_duration": 0.02,
+    "shift_green_threshold": 100,
     "button_reclick_cooldown": 0.5
   },
   "needle": {
     "start_angle_deg": 240.0,
     "end_angle_deg": -80.0,
     "radius_rel": 0.04386,
-    "white_min": 200,
-    "white_max_spread": 40,
+    "white_min": 215,
+    "white_max_spread": 35,
     "target_offset_deg": 0.0,
+    "angle_tolerance": 2.0,
+    "slow_zone_angle": 15.0,
     "radius_factors": [
-      0.85,
+      0.8,
+      0.9,
       1.0,
-      1.15
+      1.1,
+      1.2
     ],
     "zone_detect": true,
     "zone_radius_rel": 0.08772,
-    "zone_target_fraction": 0.5,
-    "zone_refresh_s": 0.2
+    "zone_target_fraction": 0.45,
+    "zone_refresh_s": 0.2,
+    "zone_r_max": 165,
+    "zone_g_min": 180,
+    "zone_b_min": 210
   },
   "points": {
     "light_box_1": {
@@ -168,11 +180,6 @@
       213,
       87,
       78
-    ],
-    "cashout_orange": [
-      245,
-      189,
-      89
     ],
     "zone_blue": [
       146,
